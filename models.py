@@ -56,17 +56,15 @@ class CurrentlyPlaying(BaseModel):
 
 class EnrichmentResult(BaseModel):
     """
-    Four semantic labels derived deterministically from Spotify audio features.
+    Semantic labels derived from Last.fm tags + release year.
 
-    mood_label    : energy × valence quadrant  (e.g. "euphoric", "melancholic")
-    tempo_label   : tempo × danceability bucket (e.g. "groovy", "fast-paced")
-    texture_label : acousticness × instrumentalness (e.g. "acoustic-vocal")
-    era_label     : decade from release year    (e.g. "1990s", "contemporary")
+    genre_tags : Last.fm genre descriptors   (e.g. ["balkan trap", "hip hop"])
+    mood_tags  : Last.fm mood descriptors    (e.g. ["melancholic", "dark"])
+    era_label  : decade from release year    (e.g. "1990s", "contemporary")
     """
-    mood_label: str = ""
-    tempo_label: str = ""
-    texture_label: str = ""
-    era_label: str = ""
+    genre_tags: list[str] = Field(default_factory=list)
+    mood_tags:  list[str] = Field(default_factory=list)
+    era_label:  str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -98,13 +96,10 @@ class TrackNode(BaseModel):
 # ---------------------------------------------------------------------------
 
 class RecommendationReason(BaseModel):
-    shared_moods: list[str] = Field(default_factory=list)
-    shared_tempos: list[str] = Field(default_factory=list)
-    shared_textures: list[str] = Field(default_factory=list)
     shared_genres: list[str] = Field(default_factory=list)
+    shared_moods: list[str] = Field(default_factory=list)
     shared_eras: list[str] = Field(default_factory=list)
     via_related_artist: bool = False
-    audio_distance: float = 0.0
     score: float = 0.0
 
 

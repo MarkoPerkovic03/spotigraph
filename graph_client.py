@@ -72,11 +72,9 @@ class GraphClient:
     async def ensure_schema(self) -> None:
         constraints = [
             "CREATE CONSTRAINT track_id   IF NOT EXISTS FOR (t:Track)   REQUIRE t.spotify_id IS UNIQUE",
-            "CREATE CONSTRAINT artist_id  IF NOT EXISTS FOR (a:Artist)  REQUIRE a.spotify_id IS UNIQUE",
+            "CREATE CONSTRAINT artist_name IF NOT EXISTS FOR (a:Artist) REQUIRE a.name IS UNIQUE",
             "CREATE CONSTRAINT genre_name IF NOT EXISTS FOR (g:Genre)   REQUIRE g.name IS UNIQUE",
             "CREATE CONSTRAINT mood_name  IF NOT EXISTS FOR (m:Mood)    REQUIRE m.name IS UNIQUE",
-            "CREATE CONSTRAINT tempo_name IF NOT EXISTS FOR (t:Tempo)   REQUIRE t.name IS UNIQUE",
-            "CREATE CONSTRAINT texture_name IF NOT EXISTS FOR (x:Texture) REQUIRE x.name IS UNIQUE",
             "CREATE CONSTRAINT era_label  IF NOT EXISTS FOR (e:Era)     REQUIRE e.label IS UNIQUE",
         ]
         indexes = [
@@ -146,8 +144,9 @@ class GraphClient:
             for artist_id, artist_name in zip(track.artist_ids, track.artist_names):
                 await session.run(
                     """
-                    MERGE (a:Artist {spotify_id: $artist_id})
-                    ON CREATE SET a.name = $artist_name
+                    MERGE (a:Artist {name: $artist_name})
+                    ON CREATE SET a.spotify_id = $artist_id
+                    ON MATCH  SET a.spotify_id = $artist_id
                     WITH a
                     MATCH (t:Track {spotify_id: $track_id})
                     MERGE (t)-[:BY]->(a)
@@ -175,36 +174,29 @@ class GraphClient:
 
     async def apply_enrichment(self, track_id: str, result: EnrichmentResult) -> None:
         async with self._driver.session() as session:
-            if result.mood_label:
+            # Genre nodes (multiple, from Last.fm)
+            for genre in result.genre_tags:
+                await session.run(
+                    """
+                    MERGE (g:Genre {name: $name})
+                    WITH g MATCH (t:Track {spotify_id: $tid})
+                    MERGE (t)-[:HAS_GENRE]->(g)
+                    """,
+                    name=genre, tid=track_id,
+                )
+
+            # Mood nodes (multiple, from Last.fm)
+            for mood in result.mood_tags:
                 await session.run(
                     """
                     MERGE (m:Mood {name: $name})
                     WITH m MATCH (t:Track {spotify_id: $tid})
                     MERGE (t)-[:EVOKES]->(m)
                     """,
-                    name=result.mood_label, tid=track_id,
+                    name=mood, tid=track_id,
                 )
 
-            if result.tempo_label:
-                await session.run(
-                    """
-                    MERGE (tp:Tempo {name: $name})
-                    WITH tp MATCH (t:Track {spotify_id: $tid})
-                    MERGE (t)-[:HAS_TEMPO]->(tp)
-                    """,
-                    name=result.tempo_label, tid=track_id,
-                )
-
-            if result.texture_label:
-                await session.run(
-                    """
-                    MERGE (tx:Texture {name: $name})
-                    WITH tx MATCH (t:Track {spotify_id: $tid})
-                    MERGE (t)-[:HAS_TEXTURE]->(tx)
-                    """,
-                    name=result.texture_label, tid=track_id,
-                )
-
+            # Era node (single, from release year)
             if result.era_label:
                 await session.run(
                     """
@@ -223,6 +215,21 @@ class GraphClient:
     # ------------------------------------------------------------------
     # Artist similarity edges (from Spotify Related Artists)
     # ------------------------------------------------------------------
+
+    async def create_artist_similar_by_name(
+        self, name1: str, name2: str, weight: float = 1.0
+    ) -> None:
+        """Create SIMILAR_TO edge between artists identified by name (from Last.fm)."""
+        async with self._driver.session() as session:
+            await session.run(
+                """
+                MERGE (a1:Artist {name: $name1})
+                MERGE (a2:Artist {name: $name2})
+                MERGE (a1)-[r:SIMILAR_TO]->(a2)
+                ON CREATE SET r.weight = $weight
+                """,
+                name1=name1, name2=name2, weight=weight,
+            )
 
     async def create_artist_similar(
         self,
@@ -272,13 +279,34 @@ class GraphClient:
     # ------------------------------------------------------------------
 
     async def is_enriched(self, track_id: str) -> bool:
+        """True only if enriched AND has at least one Genre or Mood node connected."""
         async with self._driver.session() as session:
             result = await session.run(
-                "MATCH (t:Track {spotify_id: $id}) RETURN t.enriched AS e LIMIT 1",
+                """
+                MATCH (t:Track {spotify_id: $id})
+                OPTIONAL MATCH (t)-[:HAS_GENRE]->(g:Genre)
+                OPTIONAL MATCH (t)-[:EVOKES]->(m:Mood)
+                OPTIONAL MATCH (t)-[:BY]->(a:Artist)-[:SIMILAR_TO]-(:Artist)
+                RETURN
+                    t.enriched AS enriched,
+                    count(DISTINCT g) + count(DISTINCT m) + count(DISTINCT a) AS semantic_count
+                LIMIT 1
+                """,
                 id=track_id,
             )
             record = await result.single()
-            return bool(record and record["e"])
+            if not record:
+                return False
+            return bool(record["enriched"]) and int(record["semantic_count"] or 0) > 0
+
+    async def reset_all_enrichment(self) -> int:
+        """Reset enriched flag on all tracks — forces re-enrichment next Recommend call."""
+        async with self._driver.session() as session:
+            result = await session.run(
+                "MATCH (t:Track) SET t.enriched = false RETURN count(t) AS n"
+            )
+            record = await result.single()
+            return int(record["n"]) if record else 0
 
     # ------------------------------------------------------------------
     # Candidate discovery via graph traversal
@@ -304,74 +332,50 @@ class GraphClient:
                 MATCH (seed:Track {spotify_id: $track_id})
 
                 // Collect seed's semantic labels
-                OPTIONAL MATCH (seed)-[:EVOKES]->(sm:Mood)
-                OPTIONAL MATCH (seed)-[:HAS_TEMPO]->(st:Tempo)
-                OPTIONAL MATCH (seed)-[:HAS_TEXTURE]->(sx:Texture)
-                OPTIONAL MATCH (seed)-[:BELONGS_TO_ERA]->(se:Era)
                 OPTIONAL MATCH (seed)-[:HAS_GENRE]->(sg:Genre)
-                OPTIONAL MATCH (seed)-[:BY]->(sa:Artist)-[:SIMILAR_TO]-(ra:Artist)
+                OPTIONAL MATCH (seed)-[:EVOKES]->(sm:Mood)
+                OPTIONAL MATCH (seed)-[:BELONGS_TO_ERA]->(se:Era)
+                OPTIONAL MATCH (seed)-[:BY]->(sa:Artist)-[:SIMILAR_TO*1..2]-(ra:Artist)
 
                 WITH seed,
-                     collect(DISTINCT sm.name)  AS seedMoods,
-                     collect(DISTINCT st.name)  AS seedTempos,
-                     collect(DISTINCT sx.name)  AS seedTextures,
-                     collect(DISTINCT se.label) AS seedEras,
                      collect(DISTINCT sg.name)  AS seedGenres,
-                     collect(DISTINCT ra.spotify_id) AS relArtistIds
+                     collect(DISTINCT sm.name)  AS seedMoods,
+                     collect(DISTINCT se.label) AS seedEras,
+                     collect(DISTINCT ra.name)  AS similarArtistNames
 
-                // Find all candidate tracks (not excluded)
                 MATCH (candidate:Track)
                 WHERE candidate.spotify_id <> $track_id
                   AND NOT candidate.spotify_id IN $exclude_ids
 
-                // What does the candidate share with the seed?
-                OPTIONAL MATCH (candidate)-[:EVOKES]->(cm:Mood)
-                  WHERE cm.name IN seedMoods
-                OPTIONAL MATCH (candidate)-[:HAS_TEMPO]->(ct:Tempo)
-                  WHERE ct.name IN seedTempos
-                OPTIONAL MATCH (candidate)-[:HAS_TEXTURE]->(cx:Texture)
-                  WHERE cx.name IN seedTextures
-                OPTIONAL MATCH (candidate)-[:BELONGS_TO_ERA]->(ce:Era)
-                  WHERE ce.label IN seedEras
                 OPTIONAL MATCH (candidate)-[:HAS_GENRE]->(cg:Genre)
                   WHERE cg.name IN seedGenres
+                OPTIONAL MATCH (candidate)-[:EVOKES]->(cm:Mood)
+                  WHERE cm.name IN seedMoods
+                OPTIONAL MATCH (candidate)-[:BELONGS_TO_ERA]->(ce:Era)
+                  WHERE ce.label IN seedEras
                 OPTIONAL MATCH (candidate)-[:BY]->(ca:Artist)
-                  WHERE ca.spotify_id IN relArtistIds
+                  WHERE ca.name IN similarArtistNames
 
                 WITH candidate,
-                     collect(DISTINCT cm.name)  AS sharedMoods,
-                     collect(DISTINCT ct.name)  AS sharedTempos,
-                     collect(DISTINCT cx.name)  AS sharedTextures,
-                     collect(DISTINCT ce.label) AS sharedEras,
                      collect(DISTINCT cg.name)  AS sharedGenres,
+                     collect(DISTINCT cm.name)  AS sharedMoods,
+                     collect(DISTINCT ce.label) AS sharedEras,
                      count(DISTINCT ca)         AS relatedArtistHits
 
-                WHERE size(sharedMoods) + size(sharedTempos) + size(sharedTextures)
-                    + size(sharedGenres) + size(sharedEras) + relatedArtistHits > 0
+                WHERE size(sharedGenres) + size(sharedMoods)
+                    + size(sharedEras) + relatedArtistHits > 0
 
                 RETURN DISTINCT
-                    candidate.spotify_id       AS spotify_id,
-                    candidate.name             AS name,
-                    candidate.artist_names     AS artist_names,
-                    candidate.genres           AS genres,
-                    candidate.danceability     AS danceability,
-                    candidate.energy           AS energy,
-                    candidate.valence          AS valence,
-                    candidate.tempo            AS tempo,
-                    candidate.acousticness     AS acousticness,
-                    candidate.instrumentalness AS instrumentalness,
-                    candidate.liveness         AS liveness,
-                    candidate.speechiness      AS speechiness,
-                    candidate.loudness         AS loudness,
-                    sharedMoods                AS shared_moods,
-                    sharedTempos               AS shared_tempos,
-                    sharedTextures             AS shared_textures,
-                    sharedEras                 AS shared_eras,
-                    sharedGenres               AS shared_genres,
-                    relatedArtistHits > 0      AS via_related_artist,
-                    size(sharedMoods) + size(sharedTempos) + size(sharedTextures)
-                        + size(sharedGenres) + size(sharedEras)
-                        + relatedArtistHits    AS overlap_count
+                    candidate.spotify_id   AS spotify_id,
+                    candidate.name         AS name,
+                    candidate.artist_names AS artist_names,
+                    candidate.genres       AS genres,
+                    sharedGenres           AS shared_genres,
+                    sharedMoods            AS shared_moods,
+                    sharedEras             AS shared_eras,
+                    relatedArtistHits > 0  AS via_related_artist,
+                    size(sharedGenres) * 3 + size(sharedMoods) * 2
+                        + size(sharedEras) + relatedArtistHits * 2 AS overlap_count
                 ORDER BY overlap_count DESC
                 LIMIT $limit
                 """,
@@ -411,113 +415,114 @@ class GraphClient:
         async with self._driver.session() as session:
             result = await session.run(
                 """
-                MATCH (t:Track)   WITH count(t) AS tracks
-                MATCH (a:Artist)  WITH tracks, count(a) AS artists
-                MATCH (g:Genre)   WITH tracks, artists, count(g) AS genres
-                MATCH (m:Mood)    WITH tracks, artists, genres, count(m) AS moods
-                MATCH (tp:Tempo)  WITH tracks, artists, genres, moods, count(tp) AS tempos
-                MATCH (tx:Texture) WITH tracks, artists, genres, moods, tempos, count(tx) AS textures
-                RETURN tracks, artists, genres, moods, tempos, textures
+                MATCH (t:Track)  WITH count(t) AS tracks
+                MATCH (a:Artist) WITH tracks, count(a) AS artists
+                MATCH (g:Genre)  WITH tracks, artists, count(g) AS genres
+                MATCH (m:Mood)   WITH tracks, artists, genres, count(m) AS moods
+                RETURN tracks, artists, genres, moods
                 """
             )
             record = await result.single()
             if not record:
-                return {"tracks": 0, "artists": 0, "genres": 0, "moods": 0, "tempos": 0, "textures": 0}
+                return {"tracks": 0, "artists": 0, "genres": 0, "moods": 0}
             return dict(record)
 
     async def get_neighborhood(self, track_id: str) -> dict[str, Any]:
+        """
+        Return nodes and edges for vis.js visualization.
+        Shows the seed track + all semantic nodes + connected tracks.
+        """
         async with self._driver.session() as session:
-            # Collect all nodes within 2 hops of the track
             result = await session.run(
                 """
-                MATCH (t:Track {spotify_id: $track_id})
-                OPTIONAL MATCH (t)-[:BY]->(a:Artist)
-                OPTIONAL MATCH (t)-[:HAS_GENRE]->(g:Genre)
-                OPTIONAL MATCH (t)-[:EVOKES]->(m:Mood)
-                OPTIONAL MATCH (t)-[:HAS_TEMPO]->(tp:Tempo)
-                OPTIONAL MATCH (t)-[:HAS_TEXTURE]->(tx:Texture)
-                OPTIONAL MATCH (t)-[:BELONGS_TO_ERA]->(e:Era)
-                OPTIONAL MATCH (t2:Track)-[:BELONGS_TO_ERA]->(e)
-                OPTIONAL MATCH (t2)-[:BY]->(a2:Artist)
-                WITH t,
-                     collect(DISTINCT a)  AS artists,
-                     collect(DISTINCT g)  AS genres,
-                     collect(DISTINCT m)  AS moods,
-                     collect(DISTINCT tp) AS tempos,
-                     collect(DISTINCT tx) AS textures,
-                     collect(DISTINCT e)  AS eras,
-                     collect(DISTINCT t2)[..10] AS relTracks,
-                     collect(DISTINCT a2)[..10] AS relArtists
-                RETURN t, artists, genres, moods, tempos, textures, eras, relTracks, relArtists
+                MATCH (seed:Track {spotify_id: $track_id})
+
+                OPTIONAL MATCH (seed)-[:BY]->(a:Artist)
+                OPTIONAL MATCH (seed)-[:HAS_GENRE]->(g:Genre)
+                OPTIONAL MATCH (seed)-[:EVOKES]->(m:Mood)
+                OPTIONAL MATCH (seed)-[:BELONGS_TO_ERA]->(e:Era)
+                OPTIONAL MATCH (a)-[:SIMILAR_TO]-(simA:Artist)
+                OPTIONAL MATCH (simA)<-[:BY]-(t3:Track)
+                  WHERE t3.spotify_id <> $track_id
+                OPTIONAL MATCH (g)<-[:HAS_GENRE]-(t2:Track)
+                  WHERE t2.spotify_id <> $track_id
+
+                RETURN
+                    seed,
+                    collect(DISTINCT a)[0..5]    AS artists,
+                    collect(DISTINCT g)[0..8]    AS genres,
+                    collect(DISTINCT m)[0..5]    AS moods,
+                    collect(DISTINCT e)[0..3]    AS eras,
+                    collect(DISTINCT t2)[0..10]  AS genreTracks,
+                    collect(DISTINCT simA)[0..8] AS simArtists,
+                    collect(DISTINCT t3)[0..10]  AS simArtistTracks
                 """,
                 track_id=track_id,
             )
             record = await result.single()
-            if not record:
-                return {"nodes": [], "edges": []}
+
+        if not record:
+            return {"nodes": [], "edges": []}
 
         nodes: list[dict] = []
         edges: list[dict] = []
-        seen_ids: set[str] = set()
+        seen: set[str] = set()
 
-        def add_node(node_id: str, label: str, title: str, spotify_id: str = "") -> None:
-            if node_id not in seen_ids:
-                seen_ids.add(node_id)
-                nodes.append({"node_id": node_id, "label": label, "title": title, "spotify_id": spotify_id})
+        def node(nid: str, label: str, title: str, spotify_id: str = "") -> None:
+            if nid and nid not in seen:
+                seen.add(nid)
+                nodes.append({"node_id": nid, "label": label, "title": title, "spotify_id": spotify_id})
 
-        def add_edge(src: str, tgt: str, rel_type: str) -> None:
-            edges.append({"source": src, "target": tgt, "rel_type": rel_type})
+        def edge(src: str, tgt: str, rel: str) -> None:
+            if src and tgt:
+                edges.append({"source": src, "target": tgt, "rel_type": rel})
 
-        t = record["t"]
-        t_id = track_id
-        add_node(t_id, "Track", t.get("name", ""), t_id)
+        # Seed track
+        node(track_id, "Track", record["seed"].get("name", ""), track_id)
 
         for a in record["artists"] or []:
             if a:
-                aid = a.get("spotify_id") or a.get("name", "")
-                add_node(aid, "Artist", a.get("name", ""), aid)
-                add_edge(t_id, aid, "BY")
+                aid = f"artist:{a.get('name','')}"
+                node(aid, "Artist", a.get("name", ""))
+                edge(track_id, aid, "BY")
 
         for g in record["genres"] or []:
             if g:
                 gid = f"genre:{g.get('name','')}"
-                add_node(gid, "Genre", g.get("name", ""))
-                add_edge(t_id, gid, "HAS_GENRE")
+                node(gid, "Genre", g.get("name", ""))
+                edge(track_id, gid, "HAS_GENRE")
+
+                for t2 in record["genreTracks"] or []:
+                    if t2:
+                        t2id = t2.get("spotify_id", "")
+                        node(t2id, "Track", t2.get("name", ""), t2id)
+                        edge(t2id, gid, "HAS_GENRE")
 
         for m in record["moods"] or []:
             if m:
                 mid = f"mood:{m.get('name','')}"
-                add_node(mid, "Mood", m.get("name", ""))
-                add_edge(t_id, mid, "EVOKES")
-
-        for tp in record["tempos"] or []:
-            if tp:
-                tpid = f"tempo:{tp.get('name','')}"
-                add_node(tpid, "Tempo", tp.get("name", ""))
-                add_edge(t_id, tpid, "HAS_TEMPO")
-
-        for tx in record["textures"] or []:
-            if tx:
-                txid = f"texture:{tx.get('name','')}"
-                add_node(txid, "Texture", tx.get("name", ""))
-                add_edge(t_id, txid, "HAS_TEXTURE")
+                node(mid, "Mood", m.get("name", ""))
+                edge(track_id, mid, "EVOKES")
 
         for e in record["eras"] or []:
             if e:
                 eid = f"era:{e.get('label','')}"
-                add_node(eid, "Era", e.get("label", ""))
-                add_edge(t_id, eid, "BELONGS_TO_ERA")
+                node(eid, "Era", e.get("label", ""))
+                edge(track_id, eid, "BELONGS_TO_ERA")
 
-                for t2 in record["relTracks"] or []:
-                    if t2 and t2.get("spotify_id") != track_id:
-                        t2id = t2.get("spotify_id", "")
-                        add_node(t2id, "Track", t2.get("name", ""), t2id)
-                        add_edge(t2id, eid, "BELONGS_TO_ERA")
+        for sa in record["simArtists"] or []:
+            if sa:
+                said = f"artist:{sa.get('name','')}"
+                node(said, "Artist", sa.get("name", ""))
+                for a in record["artists"] or []:
+                    if a:
+                        edge(f"artist:{a.get('name','')}", said, "SIMILAR_TO")
 
-        for a2 in record["relArtists"] or []:
-            if a2:
-                a2id = a2.get("spotify_id") or a2.get("name", "")
-                add_node(a2id, "Artist", a2.get("name", ""), a2id)
+                for t3 in record["simArtistTracks"] or []:
+                    if t3:
+                        t3id = t3.get("spotify_id", "")
+                        node(t3id, "Track", t3.get("name", ""), t3id)
+                        edge(t3id, said, "BY")
 
         return {"nodes": nodes, "edges": edges}
 

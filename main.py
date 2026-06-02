@@ -31,6 +31,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic_settings import BaseSettings
 
 from graph_client import GraphClient
+from lastfm_client import LastFmClient
 from models import HealthResponse, RecommendationResponse
 from recommender import Recommender
 from spotify_client import SpotifyClient
@@ -61,6 +62,7 @@ settings = AppSettings()
 
 graph: Optional[GraphClient] = None
 spotify: Optional[SpotifyClient] = None
+lastfm: Optional[LastFmClient] = None
 recommender_svc: Optional[Recommender] = None
 _http_client_ctx = None       # keeps the SpotifyClient context open
 _polling_task: Optional[asyncio.Task] = None
@@ -73,7 +75,7 @@ _last_track_id: Optional[str] = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global graph, spotify, recommender_svc, _http_client_ctx, _polling_task
+    global graph, spotify, lastfm, recommender_svc, _http_client_ctx, _polling_task
 
     # Boot services
     graph = GraphClient()
@@ -89,7 +91,9 @@ async def lifespan(app: FastAPI):
     _http_client_ctx = spotify
     await spotify.__aenter__()
 
-    recommender_svc = Recommender(graph=graph, spotify=spotify)
+    lastfm = LastFmClient()
+    await lastfm.__aenter__()
+    recommender_svc = Recommender(graph=graph, spotify=spotify, lastfm=lastfm)
 
     logger.info("SpotiGraph started on http://%s:%d", settings.app_host, settings.app_port)
 
@@ -105,6 +109,8 @@ async def lifespan(app: FastAPI):
 
     if spotify:
         await spotify.__aexit__(None, None, None)
+    if lastfm:
+        await lastfm.__aexit__(None, None, None)
     if graph:
         await graph.close()
     logger.info("SpotiGraph shut down cleanly")
@@ -250,6 +256,28 @@ async def graph_stats():
     """Return node/edge counts for the dashboard."""
     _check_ready()
     return await graph.get_stats()
+
+
+# ---------------------------------------------------------------------------
+# Admin / debug endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/admin/reset-enrichment", tags=["Admin"])
+async def reset_enrichment():
+    """Reset enriched flag on all tracks so they get re-enriched on next Recommend."""
+    _check_ready()
+    n = await graph.reset_all_enrichment()
+    return {"reset": n, "message": f"{n} tracks will be re-enriched on next Recommend"}
+
+
+@app.get("/admin/test-lastfm/{artist_name}", tags=["Admin"])
+async def test_lastfm(artist_name: str):
+    """Test what Last.fm returns for an artist name."""
+    if lastfm is None:
+        raise HTTPException(503, "Last.fm client not initialized")
+    tags = await lastfm.get_artist_tags(artist_name)
+    similar = await lastfm.get_similar_artists(artist_name, limit=5)
+    return {"artist": artist_name, "tags": tags, "similar_artists": similar}
 
 
 # ---------------------------------------------------------------------------
