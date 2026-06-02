@@ -334,14 +334,19 @@ class SpotifyClient:
         return track
 
     async def get_tracks_batch(self, track_ids: list[str]) -> list[TrackInfo]:
-        """Fetch up to 50 tracks at once."""
+        """Fetch tracks — tries batch first, falls back to individual calls on 403."""
         if not track_ids:
             return []
         ids = ",".join(track_ids[:50])
         data = await self._get("/tracks", ids=ids)
-        if not data:
-            return []
-        tracks = [_parse_track(t) for t in data.get("tracks", []) if t]
+        if data:
+            return [_parse_track(t) for t in data.get("tracks", []) if t]
+        # Batch endpoint blocked — fetch individually
+        tracks: list[TrackInfo] = []
+        for tid in track_ids[:50]:
+            t = await self.get_track(tid)
+            if t:
+                tracks.append(t)
         return tracks
 
     async def get_audio_features_batch(self, track_ids: list[str]) -> dict[str, AudioFeatures]:

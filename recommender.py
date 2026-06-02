@@ -3,19 +3,18 @@
 Pipeline
 --------
 1. Get currently playing track from Spotify.
-2. Upsert track into Neo4j (audio features as node properties).
-3. Rule-based enrichment → Mood / Tempo / Texture / Era nodes attached.
-4. Graph bootstrap (runs once per track):
-     - Fetch Related Artists from Spotify → SIMILAR_TO edges between Artist nodes.
-     - Fetch top tracks for each related artist → upsert + enrich those tracks too.
-   This populates the graph so traversal can find real candidates.
-5. Traverse graph: find tracks sharing Mood / Tempo / Texture / Era / Genre
-   nodes, or reachable via related Artist edges.
-6. Score candidates:
-     score = semantic_overlap × W_OVERLAP
-           + artist_bonus    × W_ARTIST
-           - audio_distance  × W_AUDIO
-7. Return top N; optionally add to Spotify queue.
+2. Enrich track via Last.fm (genre + mood tags → graph nodes).
+3. Bootstrap graph:
+     a. Last.fm similar artists → search on Spotify → ingest tracks
+     b. User's saved tracks → ingest
+4. Traverse graph: find tracks sharing Genre / Mood / Era nodes
+   or connected via SIMILAR_TO artist edges.
+5. Score candidates:
+     score = genre_overlap × 3
+           + mood_overlap  × 2
+           + era_overlap   × 1
+           + artist_bonus  × 2
+6. Return top N; optionally add to Spotify queue.
 """
 
 from __future__ import annotations
@@ -24,9 +23,9 @@ import logging
 from typing import Optional
 
 from enrichment import enrich
-from graph_client import GraphClient, audio_distance
+from graph_client import GraphClient
+from lastfm_client import LastFmClient
 from models import (
-    AudioFeatures,
     Recommendation,
     RecommendationReason,
     RecommendationResponse,
@@ -36,20 +35,20 @@ from spotify_client import SpotifyClient
 
 logger = logging.getLogger(__name__)
 
-# Scoring weights
-W_OVERLAP = 2.0   # reward shared semantic nodes (Mood/Tempo/Texture/Era/Genre)
-W_ARTIST  = 3.0   # reward reachability via related-artist edges
-W_AUDIO   = 1.5   # penalise sonic dissimilarity
-
-# Bootstrap: how many related artists and their top tracks to ingest
-MAX_RELATED_ARTISTS = 5
-MAX_TOP_TRACKS_PER_ARTIST = 5
+MAX_SIMILAR_ARTISTS = 5
+MAX_TRACKS_PER_ARTIST = 10
 
 
 class Recommender:
-    def __init__(self, graph: GraphClient, spotify: SpotifyClient) -> None:
-        self._graph = graph
+    def __init__(
+        self,
+        graph: GraphClient,
+        spotify: SpotifyClient,
+        lastfm: LastFmClient,
+    ) -> None:
+        self._graph   = graph
         self._spotify = spotify
+        self._lastfm  = lastfm
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -66,16 +65,12 @@ class Recommender:
             return None
 
         source = now_playing.track
-
-        # Ensure track is in graph with audio features and semantic nodes
         await self._ensure_track_in_graph(source)
 
-        # Build exclusion list (queue + recently played + current)
         exclude = set(await self._spotify.get_recently_played(limit=20))
         exclude |= set(await self._spotify.get_queue())
         exclude.add(source.spotify_id)
 
-        # Graph traversal
         candidates_raw = await self._graph.find_candidates(
             track_id=source.spotify_id,
             exclude_ids=list(exclude),
@@ -83,28 +78,14 @@ class Recommender:
         )
 
         if not candidates_raw:
-            logger.info("No graph candidates — graph is still sparse; bootstrapping helped but may need more tracks")
+            logger.info("No candidates found — graph may need more tracks")
             return RecommendationResponse(
                 source_track=source,
                 recommendations=[],
                 added_to_queue=False,
             )
 
-        # Source audio features for distance calculation
-        source_af = await self._graph.get_track_audio_features(source.spotify_id)
-        if source_af is None:
-            af = source.audio_features or AudioFeatures()
-            source_af = {
-                "danceability": af.danceability, "energy": af.energy,
-                "valence": af.valence,           "tempo": af.tempo,
-                "acousticness": af.acousticness, "instrumentalness": af.instrumentalness,
-                "liveness": af.liveness,         "speechiness": af.speechiness,
-            }
-
-        scored = _score_candidates(candidates_raw, source_af)
-        top = scored[:limit]
-
-        # Fetch full TrackInfo for top candidates
+        top = candidates_raw[:limit]
         track_map = {t.spotify_id: t for t in await self._spotify.get_tracks_batch(
             [c["spotify_id"] for c in top]
         )}
@@ -116,21 +97,16 @@ class Recommender:
                 spotify_id=tid,
                 name=c.get("name", "Unknown"),
                 artist_names=list(c.get("artist_names") or []),
-                artist_ids=[],
-                album_name="", album_id="", duration_ms=0,
-                genres=list(c.get("genres") or []),
+                artist_ids=[], album_name="", album_id="", duration_ms=0,
             )
             recommendations.append(Recommendation(
                 track=track_info,
                 reason=RecommendationReason(
-                    shared_moods=list(c.get("shared_moods") or []),
-                    shared_tempos=list(c.get("shared_tempos") or []),
-                    shared_textures=list(c.get("shared_textures") or []),
                     shared_genres=list(c.get("shared_genres") or []),
+                    shared_moods=list(c.get("shared_moods") or []),
                     shared_eras=list(c.get("shared_eras") or []),
                     via_related_artist=bool(c.get("via_related_artist")),
-                    audio_distance=round(c["audio_dist"], 3),
-                    score=round(c["score"], 3),
+                    score=round(float(c.get("overlap_count", 0)), 2),
                 ),
             ))
 
@@ -149,7 +125,7 @@ class Recommender:
         )
 
     # ------------------------------------------------------------------
-    # Ingest a single track (used by /ingest endpoint + bootstrap)
+    # Manual ingestion (used by /ingest endpoint)
     # ------------------------------------------------------------------
 
     async def ingest_track_by_id(self, spotify_id: str) -> Optional[TrackInfo]:
@@ -160,102 +136,74 @@ class Recommender:
         return track
 
     # ------------------------------------------------------------------
-    # Internal: ensure track is fully in graph
+    # Internal: ensure track is enriched in graph
     # ------------------------------------------------------------------
 
     async def _ensure_track_in_graph(self, track: TrackInfo) -> None:
-        # Fetch audio features if not yet loaded
-        if track.audio_features is None:
-            track.audio_features = await self._spotify.get_audio_features(track.spotify_id)
-
         await self._graph.upsert_track(track)
 
         if not await self._graph.is_enriched(track.spotify_id):
-            result = enrich(track)   # pure rule-based, no API call
+            result = await enrich(track, self._lastfm)
             await self._graph.apply_enrichment(track.spotify_id, result)
-            logger.debug("Enriched '%s' → mood=%s tempo=%s texture=%s era=%s",
-                         track.name, result.mood_label, result.tempo_label,
-                         result.texture_label, result.era_label)
-
-            # Bootstrap graph edges for this track (runs once per track)
+            logger.info("Last.fm enrichment result: %s", result.model_dump())
+            logger.info(
+                "Enriched '%s' → genres=%s moods=%s era=%s",
+                track.name,
+                result.genre_tags[:3],
+                result.mood_tags[:2],
+                result.era_label,
+            )
             await self._bootstrap_graph(track)
 
     # ------------------------------------------------------------------
-    # Bootstrap: Related Artists → SIMILAR_TO edges + their top tracks
+    # Bootstrap: Last.fm similar artists → Spotify search → ingest
     # ------------------------------------------------------------------
 
     async def _bootstrap_graph(self, track: TrackInfo) -> None:
         """
-        Populate the graph with genre- and artist-appropriate tracks.
+        Build graph edges by:
+        1. Asking Last.fm for artists similar to this track's artist.
+        2. Searching Spotify for those artists' tracks.
+        3. Ingesting + enriching those tracks.
+        4. Creating SIMILAR_TO edges between artists in the graph.
 
-        Priority order:
-        1. Search by genre  — most semantically relevant candidates
-        2. Search by artist — more tracks from the same artist
-        3. Saved tracks     — user's personal library as fallback
+        Also ingests user's saved tracks as personal context.
         """
         ingested = 0
 
-        async def ingest(t: TrackInfo) -> None:
-            nonlocal ingested
-            # Fetch genres if missing (single artist endpoint)
-            if not t.genres and t.artist_ids:
-                t.genres = await self._spotify._get_artist_genres(t.artist_ids)
+        for artist_name in track.artist_names[:2]:
+            similar = await self._lastfm.get_similar_artists(
+                artist_name, limit=MAX_SIMILAR_ARTISTS
+            )
+            logger.info("Last.fm similar artists for '%s': %s", artist_name, [s['name'] for s in similar])
+            for sim in similar:
+                sim_name = sim["name"]
+                weight   = float(sim["match"])
+
+                # Search Spotify for this similar artist's tracks
+                results = await self._spotify.search_tracks(
+                    f'artist:"{sim_name}"', limit=MAX_TRACKS_PER_ARTIST
+                )
+                for t in results:
+                    await self._graph.upsert_track(t)
+                    if not await self._graph.is_enriched(t.spotify_id):
+                        r = await enrich(t, self._lastfm)
+                        await self._graph.apply_enrichment(t.spotify_id, r)
+                    ingested += 1
+
+                # Create SIMILAR_TO edge (artist_name → sim_name)
+                # We use artist names as IDs here since we may not have Spotify IDs
+                await self._graph.create_artist_similar_by_name(
+                    artist_name, sim_name, weight
+                )
+
+        # Also ingest user's saved tracks as personal context
+        saved = await self._spotify.get_saved_tracks(limit=30)
+        for t in saved:
             await self._graph.upsert_track(t)
             if not await self._graph.is_enriched(t.spotify_id):
-                await self._graph.apply_enrichment(t.spotify_id, enrich(t))
+                r = await enrich(t, self._lastfm)
+                await self._graph.apply_enrichment(t.spotify_id, r)
             ingested += 1
 
-        # Source 1: search by genre (best match — genre-homogeneous candidates)
-        for genre in track.genres[:3]:
-            results = await self._spotify.search_tracks(f'genre:"{genre}"', limit=20)
-            for t in results:
-                await ingest(t)
-
-        # Source 2: search by artist name
-        for artist_name in track.artist_names[:2]:
-            results = await self._spotify.search_tracks(
-                f'artist:"{artist_name}"', limit=20
-            )
-            for t in results:
-                await ingest(t)
-
-        # Source 3: saved tracks (personal library fallback)
-        saved = await self._spotify.get_saved_tracks(limit=50)
-        for t in saved:
-            await ingest(t)
-
         logger.info("Bootstrap complete — %d tracks ingested into graph", ingested)
-
-
-# ---------------------------------------------------------------------------
-# Scoring
-# ---------------------------------------------------------------------------
-
-def _score_candidates(
-    candidates: list[dict],
-    source_af: dict[str, float],
-) -> list[dict]:
-    for c in candidates:
-        overlap = (
-            len(c.get("shared_moods")    or [])
-            + len(c.get("shared_tempos")   or [])
-            + len(c.get("shared_textures") or [])
-            + len(c.get("shared_genres")   or [])
-            + len(c.get("shared_eras")     or [])
-        )
-        artist_bonus = 1 if c.get("via_related_artist") else 0
-        candidate_af = {
-            "danceability":    c.get("danceability", 0.0),
-            "energy":          c.get("energy", 0.0),
-            "valence":         c.get("valence", 0.0),
-            "tempo":           c.get("tempo", 0.0),
-            "acousticness":    c.get("acousticness", 0.0),
-            "instrumentalness":c.get("instrumentalness", 0.0),
-            "liveness":        c.get("liveness", 0.0),
-            "speechiness":     c.get("speechiness", 0.0),
-        }
-        adist = audio_distance(source_af, candidate_af)
-        c["audio_dist"] = adist
-        c["score"] = overlap * W_OVERLAP + artist_bonus * W_ARTIST - adist * W_AUDIO
-
-    return sorted(candidates, key=lambda x: x["score"], reverse=True)
