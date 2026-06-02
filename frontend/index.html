@@ -342,7 +342,7 @@
       <div class="stat-box"><div class="num" id="stat-tracks">—</div><div class="lbl">Tracks</div></div>
       <div class="stat-box"><div class="num" id="stat-artists">—</div><div class="lbl">Artists</div></div>
       <div class="stat-box"><div class="num" id="stat-moods">—</div><div class="lbl">Moods</div></div>
-      <div class="stat-box"><div class="num" id="stat-concepts">—</div><div class="lbl">Concepts</div></div>
+      <div class="stat-box"><div class="num" id="stat-concepts">—</div><div class="lbl">Genres</div></div>
     </div>
   </div>
 </aside>
@@ -371,7 +371,7 @@ const visNodes = new vis.DataSet();
 const visEdges = new vis.DataSet();
 
 const NODE_COLORS = {
-  Track:   { background: "#1db954", border: "#17a349", font: { color: "#000", size: 11 } },
+  Track:   { background: "#1db954", border: "#17a349", font: { color: "#000", size: 11, bold: false } },
   Artist:  { background: "#4a90e2", border: "#3378c5", font: { color: "#fff", size: 10 } },
   Genre:   { background: "#e2844a", border: "#c8693a", font: { color: "#fff", size: 10 } },
   Mood:    { background: "#c07ef7", border: "#a765e2", font: { color: "#fff", size: 10 } },
@@ -379,23 +379,41 @@ const NODE_COLORS = {
   Era:     { background: "#f7d57e", border: "#e4c065", font: { color: "#000", size: 10 } },
 };
 
+// Seed track node style (currently playing)
+const SEED_STYLE = {
+  background: "#ffffff", border: "#1db954",
+  font: { color: "#000", size: 13, bold: true },
+  size: 28, borderWidth: 3,
+};
+
 function initNetwork() {
   const container = document.getElementById("vis-container");
   const options = {
     physics: {
       enabled: true,
-      stabilization: { iterations: 100 },
-      barnesHut: { gravitationalConstant: -3000, springLength: 120 },
+      stabilization: { iterations: 150, updateInterval: 25 },
+      barnesHut: {
+        gravitationalConstant: -8000,
+        centralGravity: 0.3,
+        springLength: 160,
+        springConstant: 0.04,
+        damping: 0.09,
+      },
     },
     edges: {
-      color: { color: "#444", highlight: "#1db954" },
-      width: 1.5,
-      smooth: { type: "continuous" },
-      font: { color: "#666", size: 9 },
-      arrows: { to: { enabled: true, scaleFactor: 0.5 } },
+      color: { color: "#333", highlight: "#1db954", hover: "#555" },
+      width: 1,
+      smooth: { type: "dynamic" },
+      arrows: { to: { enabled: true, scaleFactor: 0.4 } },
+      selectionWidth: 2,
     },
-    nodes: { shape: "dot", size: 14 },
-    interaction: { hover: true, tooltipDelay: 200 },
+    nodes: { shape: "dot" },
+    interaction: {
+      hover: true,
+      tooltipDelay: 100,
+      navigationButtons: false,
+      keyboard: false,
+    },
   };
   network = new vis.Network(container, { nodes: visNodes, edges: visEdges }, options);
 
@@ -403,8 +421,21 @@ function initNetwork() {
     if (params.nodes.length > 0) {
       const nodeId = params.nodes[0];
       const node = visNodes.get(nodeId);
-      if (node && node.label === "Track" && node.spotify_id) {
-        loadNeighborhood(node.spotify_id);
+      if (node && node.spotify_id) {
+        if (node.group === "Track") {
+          // Single click on track: load its neighborhood
+          loadNeighborhood(node.spotify_id);
+        }
+      }
+    }
+  });
+
+  network.on("doubleClick", (params) => {
+    if (params.nodes.length > 0) {
+      const nodeId = params.nodes[0];
+      const node = visNodes.get(nodeId);
+      if (node && node.spotify_id) {
+        window.open(`https://open.spotify.com/track/${node.spotify_id}`, "_blank");
       }
     }
   });
@@ -491,8 +522,10 @@ async function refreshNowPlaying() {
 // ── Recommendations ─────────────────────────────────────────────────────────
 async function runRecommend(queue = false) {
   const el = document.getElementById("rec-list");
-  el.innerHTML = `<div class="empty"><span class="spinner"></span>Traversing graph…</div>`;
+  el.innerHTML = `<div class="empty"><span class="spinner"></span>Analysing graph… (first run may take ~15s)</div>`;
   setStatus("Running recommendation engine…");
+  document.getElementById("btn-recommend").disabled = true;
+  document.getElementById("btn-queue").disabled = true;
 
   try {
     const endpoint = queue ? "/recommend/queue?limit=5" : "/recommend?limit=5";
@@ -513,14 +546,15 @@ async function runRecommend(queue = false) {
       const artistBadge = r.reason.via_related_artist
         ? `<span class="tag" style="background:#1a2a3a;color:#7eb8f7">related artist</span>` : "";
 
+      const spotifyUrl = r.track.external_url || `https://open.spotify.com/track/${r.track.spotify_id}`;
       return `
-        <div class="rec-item">
+        <div class="rec-item" style="cursor:pointer" onclick="window.open('${spotifyUrl}','_blank')" title="Open in Spotify">
           <div class="rec-rank">${i + 1}</div>
           <div class="rec-body">
             <div class="rec-name">${esc(r.track.name)}</div>
             <div class="rec-artist">${esc((r.track.artist_names || []).join(", "))}</div>
             <div class="rec-tags">
-              ${moodTags}${tempoTags}${textureTags}${genreTags}${eraTags}${artistBadge}
+              ${moodTags}${genreTags}${eraTags}${artistBadge}
             </div>
           </div>
           <div class="rec-score">${r.reason.score.toFixed(1)}</div>
@@ -537,6 +571,9 @@ async function runRecommend(queue = false) {
     el.innerHTML = `<div class="empty">Error: ${e.message}</div>`;
     setStatus("Recommendation failed — check console");
     console.error(e);
+  } finally {
+    document.getElementById("btn-recommend").disabled = false;
+    document.getElementById("btn-queue").disabled = false;
   }
 }
 
@@ -555,17 +592,26 @@ function renderGraph(rawNodes, rawEdges) {
   visNodes.clear();
   visEdges.clear();
 
+  const seedId = currentTrackId;
+
   const nodeData = rawNodes.map(n => {
-    const style = NODE_COLORS[n.label] || { background: "#666", border: "#555", font: { color: "#fff", size: 10 } };
+    const isSeed = n.spotify_id === seedId && n.label === "Track";
+    const style = isSeed ? SEED_STYLE
+                 : NODE_COLORS[n.label] || { background: "#666", border: "#555", font: { color: "#fff", size: 10 } };
+    const rawTitle = n.title || n.label;
+    const shortLabel = rawTitle.length > 18 ? rawTitle.slice(0, 16) + "…" : rawTitle;
+    const displayLabel = (n.label === "Track" || n.label === "Artist") ? shortLabel : rawTitle;
+    const hint = n.spotify_id ? (isSeed ? "Now Playing" : "Doppelklick → Spotify") : "";
     return {
       id: n.node_id,
-      label: n.title || n.label,
+      label: isSeed ? `▶ ${displayLabel}` : displayLabel,
       group: n.label,
       color: { background: style.background, border: style.border },
+      borderWidth: isSeed ? 3 : 1,
       font: style.font,
-      title: `${n.label}: ${n.title}`,
+      title: `<b>${n.label}</b>: ${rawTitle}${hint ? `<br><i>${hint}</i>` : ""}`,
       spotify_id: n.spotify_id,
-      size: n.label === "Track" ? 18 : 12,
+      size: isSeed ? 28 : n.label === "Track" ? 16 : n.label === "Artist" ? 13 : 10,
     };
   });
 
@@ -573,7 +619,8 @@ function renderGraph(rawNodes, rawEdges) {
     id: i,
     from: e.source,
     to: e.target,
-    label: e.rel_type.replace(/_/g, " ").toLowerCase(),
+    label: "",   // hide edge labels to reduce clutter
+    title: e.rel_type.replace(/_/g, " ").toLowerCase(),
   }));
 
   visNodes.add(nodeData);
@@ -587,7 +634,7 @@ async function refreshStats() {
     document.getElementById("stat-tracks").textContent   = s.tracks   ?? "—";
     document.getElementById("stat-artists").textContent  = s.artists  ?? "—";
     document.getElementById("stat-moods").textContent    = s.moods    ?? "—";
-    document.getElementById("stat-concepts").textContent = s.concepts ?? "—";
+    document.getElementById("stat-concepts").textContent = s.genres   ?? "—";
   } catch { /* ignore */ }
 }
 
