@@ -362,20 +362,20 @@ class GraphClient:
                      collect(DISTINCT ce.label) AS sharedEras,
                      count(DISTINCT ca)         AS relatedArtistHits
 
-                WHERE size(sharedGenres) + size(sharedMoods)
-                    + size(sharedEras) + relatedArtistHits > 0
+                // Require at least one genre OR mood match — artist bonus alone is not enough
+                WHERE size(sharedGenres) + size(sharedMoods) > 0
 
                 RETURN DISTINCT
                     candidate.spotify_id   AS spotify_id,
                     candidate.name         AS name,
                     candidate.artist_names AS artist_names,
                     candidate.genres       AS genres,
+                    candidate.popularity   AS popularity,
                     sharedGenres           AS shared_genres,
                     sharedMoods            AS shared_moods,
                     sharedEras             AS shared_eras,
                     relatedArtistHits > 0  AS via_related_artist,
-                    size(sharedGenres) * 3 + size(sharedMoods) * 2
-                        + size(sharedEras) + relatedArtistHits * 2 AS overlap_count
+                    size(sharedGenres) + size(sharedMoods) AS overlap_count
                 ORDER BY overlap_count DESC
                 LIMIT $limit
                 """,
@@ -388,6 +388,17 @@ class GraphClient:
     # ------------------------------------------------------------------
     # Audio features for scoring
     # ------------------------------------------------------------------
+
+    async def get_genre_frequencies(self) -> dict[str, int]:
+        """Return {genre_name: track_count} — used for TF-IDF genre weighting."""
+        async with self._driver.session() as session:
+            result = await session.run(
+                """
+                MATCH (g:Genre)<-[:HAS_GENRE]-(t:Track)
+                RETURN g.name AS genre, count(t) AS freq
+                """
+            )
+            return {r["genre"]: r["freq"] async for r in result}
 
     async def get_track_audio_features(self, track_id: str) -> Optional[dict[str, float]]:
         async with self._driver.session() as session:

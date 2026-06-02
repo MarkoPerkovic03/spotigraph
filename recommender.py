@@ -9,17 +9,28 @@ Pipeline
      b. User's saved tracks → ingest
 4. Traverse graph: find tracks sharing Genre / Mood / Era nodes
    or connected via SIMILAR_TO artist edges.
-5. Score candidates:
-     score = genre_overlap × 3
-           + mood_overlap  × 2
-           + era_overlap   × 1
-           + artist_bonus  × 2
-6. Return top N; optionally add to Spotify queue.
+5. Score candidates using three signals:
+     a. TF-IDF Genre Score  — rare shared genres score higher than common ones
+     b. Multi-Signal Bonus  — bonus when genre + mood + artist all match
+     c. Popularity Penalty  — penalize large popularity gap (niche vs mainstream)
+6. Return top N (max 1 per artist); optionally add to Spotify queue.
+
+Scoring formula
+---------------
+    genre_score    = Σ  log((N+1)/(freq_i+1)) + 1   for each shared genre i
+    mood_score     = shared_moods × 2.0
+    era_score      = shared_eras  × 0.5
+    multi_bonus    = (active_signals - 1) × 1.5      if >1 signal active
+    pop_penalty    = |seed.popularity - cand.popularity| / 100 × 0.8
+    ──────────────────────────────────────────────────────────────────
+    final_score    = genre_score + mood_score + era_score
+                   + multi_bonus - pop_penalty
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from typing import Optional
 
 from enrichment import enrich
@@ -74,7 +85,7 @@ class Recommender:
         candidates_raw = await self._graph.find_candidates(
             track_id=source.spotify_id,
             exclude_ids=list(exclude),
-            candidate_limit=max(limit * 10, 50),
+            candidate_limit=max(limit * 15, 75),
         )
 
         if not candidates_raw:
@@ -85,7 +96,25 @@ class Recommender:
                 added_to_queue=False,
             )
 
-        top = candidates_raw[:limit]
+        # Genre frequencies for TF-IDF weighting
+        genre_freqs = await self._graph.get_genre_frequencies()
+        total_tracks = max(sum(genre_freqs.values()) // max(len(genre_freqs), 1), 1)
+        seed_popularity = source.popularity or 50
+
+        # Score with TF-IDF + multi-signal + popularity
+        scored = _score_candidates(candidates_raw, genre_freqs, total_tracks, seed_popularity)
+
+        # Diversity: max 1 track per artist
+        top: list[dict] = []
+        seen_artists: set[str] = set()
+        for c in scored:
+            artist_names = [a.lower() for a in (c.get("artist_names") or [])]
+            if any(a in seen_artists for a in artist_names):
+                continue
+            top.append(c)
+            seen_artists.update(artist_names)
+            if len(top) >= limit:
+                break
         track_map = {t.spotify_id: t for t in await self._spotify.get_tracks_batch(
             [c["spotify_id"] for c in top]
         )}
@@ -106,7 +135,7 @@ class Recommender:
                     shared_moods=list(c.get("shared_moods") or []),
                     shared_eras=list(c.get("shared_eras") or []),
                     via_related_artist=bool(c.get("via_related_artist")),
-                    score=round(float(c.get("overlap_count", 0)), 2),
+                    score=round(float(c.get("score", 0)), 2),
                 ),
             ))
 
@@ -207,3 +236,65 @@ class Recommender:
             ingested += 1
 
         logger.info("Bootstrap complete — %d tracks ingested into graph", ingested)
+
+
+# ---------------------------------------------------------------------------
+# Scoring: TF-IDF genres + multi-signal bonus + popularity penalty
+# ---------------------------------------------------------------------------
+
+def _score_candidates(
+    candidates: list[dict],
+    genre_freqs: dict[str, int],
+    total_tracks: int,
+    seed_popularity: int,
+) -> list[dict]:
+    """
+    Score each candidate track using three signals:
+
+    1. TF-IDF Genre Score
+       Rare shared genres score higher than common ones.
+       score_i = log((N+1) / (freq_i+1)) + 1   for each shared genre i
+       → "balkanski trap" shared by 3 tracks scores ~3× higher than
+         "pop" shared by 150 tracks.
+
+    2. Multi-Signal Bonus
+       Bonus when more than one signal type is active simultaneously
+       (genre + mood, genre + artist, all three).
+       bonus = (active_signals - 1) × 1.5
+       → Rewards tracks with multiple independent reasons to be recommended.
+
+    3. Popularity Penalty
+       Penalizes large popularity gaps between seed and candidate.
+       penalty = |seed_pop - cand_pop| / 100 × 0.8
+       → Playing underground music → mainstream hits are penalized.
+    """
+    for c in candidates:
+        shared_genres  = c.get("shared_genres")  or []
+        shared_moods   = c.get("shared_moods")   or []
+        shared_eras    = c.get("shared_eras")     or []
+        via_artist     = bool(c.get("via_related_artist"))
+        cand_popularity = int(c.get("popularity") or 50)
+
+        # 1. TF-IDF genre score
+        genre_score = 0.0
+        for genre in shared_genres:
+            freq = genre_freqs.get(genre, 1)
+            idf = math.log((total_tracks + 1) / (freq + 1)) + 1
+            genre_score += idf
+
+        # 2. Mood score
+        mood_score = len(shared_moods) * 2.0
+
+        # 3. Era score (minor signal)
+        era_score = len(shared_eras) * 0.5
+
+        # 4. Multi-signal bonus
+        active_signals = sum([genre_score > 0, mood_score > 0, via_artist])
+        multi_bonus = (active_signals - 1) * 1.5 if active_signals > 1 else 0.0
+
+        # 5. Popularity penalty
+        pop_penalty = abs(seed_popularity - cand_popularity) / 100.0 * 0.8
+
+        c["score"] = genre_score + mood_score + era_score + multi_bonus - pop_penalty
+
+    return sorted(candidates, key=lambda x: x["score"], reverse=True)

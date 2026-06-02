@@ -106,6 +106,9 @@ async def _spotify_request(
         resp = await client.request(method, url, **kwargs)
         if resp.status_code == 429:
             retry_after = float(resp.headers.get("Retry-After", delay))
+            if retry_after > 60:
+                logger.warning("Spotify rate limit too long (%.0fs) — skipping request", retry_after)
+                return None
             logger.warning("Spotify rate limit hit — waiting %.1fs (attempt %d)", retry_after, attempt + 1)
             await asyncio.sleep(retry_after)
             delay = min(delay * 2, 60)
@@ -285,9 +288,7 @@ class SpotifyClient:
             return None
 
         track = _parse_track(item)
-        # Enrich with genres from artist
-        track.genres = await self._get_artist_genres(track.artist_ids)
-
+        # Genres come from Last.fm enrichment — skip Spotify artist API call to avoid rate limits
         context = data.get("context") or {}
         return CurrentlyPlaying(
             track=track,
@@ -329,7 +330,6 @@ class SpotifyClient:
         if not data:
             return None
         track = _parse_track(data)
-        track.genres = await self._get_artist_genres(track.artist_ids)
         track.audio_features = await self.get_audio_features(track_id)
         return track
 
