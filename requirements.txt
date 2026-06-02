@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+spotipy
+neo4j
+python-dotenv
+pydantic
+pydantic-settings
+httpx
+python-jose[cryptography]
+itsdangerous
+aiofiles
+cryptography

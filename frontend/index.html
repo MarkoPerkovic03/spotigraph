@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SpotiGraph — Knowledge Graph Queue</title>
+  <script src="https://unpkg.com/vis-network@9.1.9/dist/vis-network.min.js"></script>
+  <link rel="stylesheet" href="https://unpkg.com/vis-network@9.1.9/dist/dist/vis-network.min.css" />
+  <style>
+    :root {
+      --bg: #0d0d0d;
+      --surface: #1a1a1a;
+      --surface2: #242424;
+      --accent: #1db954;      /* Spotify green */
+      --accent2: #4a90e2;
+      --text: #e8e8e8;
+      --text-dim: #888;
+      --border: #333;
+      --danger: #e74c3c;
+      --radius: 8px;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      height: 100vh;
+      display: grid;
+      grid-template-rows: 56px 1fr;
+      grid-template-columns: 360px 1fr;
+      grid-template-areas:
+        "header header"
+        "sidebar graph";
+    }
+
+    /* ── Header ─────────────────────────────────────────── */
+    header {
+      grid-area: header;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 0 20px;
+    }
+
+    .logo {
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--accent);
+      letter-spacing: -0.5px;
+    }
+
+    .logo span { color: var(--text-dim); font-weight: 400; font-size: 14px; margin-left: 6px; }
+
+    .spacer { flex: 1; }
+
+    .dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--text-dim); margin-right: 4px; display: inline-block;
+    }
+    .dot.ok { background: var(--accent); }
+    .dot.err { background: var(--danger); }
+
+    .status-pill {
+      display: flex; align-items: center; gap: 4px;
+      font-size: 12px; color: var(--text-dim);
+      background: var(--surface2); padding: 4px 10px;
+      border-radius: 20px; border: 1px solid var(--border);
+    }
+
+    /* ── Sidebar ─────────────────────────────────────────── */
+    aside {
+      grid-area: sidebar;
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      overflow-y: auto;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .card {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 14px;
+    }
+
+    .card h3 {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--text-dim);
+      margin-bottom: 10px;
+    }
+
+    /* Now playing */
+    .now-playing {
+      display: flex; gap: 10px; align-items: center;
+    }
+
+    .album-art {
+      width: 52px; height: 52px; border-radius: 4px;
+      background: var(--border); flex-shrink: 0;
+      object-fit: cover;
+    }
+
+    .track-meta .track-name {
+      font-size: 14px; font-weight: 600;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      max-width: 230px;
+    }
+
+    .track-meta .track-artist {
+      font-size: 12px; color: var(--text-dim); margin-top: 2px;
+    }
+
+    .track-meta .track-genres {
+      margin-top: 4px; display: flex; gap: 4px; flex-wrap: wrap;
+    }
+
+    .tag {
+      font-size: 10px; padding: 2px 7px;
+      border-radius: 12px; background: var(--border);
+      color: var(--text-dim); white-space: nowrap;
+    }
+
+    .tag.mood  { background: #1a3a2a; color: #50c878; }
+    .tag.concept { background: #1a2a3a; color: #7eb8f7; }
+    .tag.genre { background: #2a1a3a; color: #c07ef7; }
+
+    /* Progress bar */
+    .progress-wrap {
+      margin-top: 8px; background: var(--border);
+      height: 3px; border-radius: 2px; overflow: hidden;
+    }
+    .progress-bar {
+      height: 100%; background: var(--accent);
+      transition: width 1s linear;
+    }
+
+    /* Buttons */
+    .btn {
+      display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+      padding: 8px 14px; border-radius: 6px; border: none; cursor: pointer;
+      font-size: 13px; font-weight: 600; transition: opacity .15s;
+    }
+    .btn:hover { opacity: .85; }
+    .btn:disabled { opacity: .4; cursor: default; }
+    .btn-primary { background: var(--accent); color: #000; }
+    .btn-secondary { background: var(--surface); border: 1px solid var(--border); color: var(--text); }
+    .btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
+
+    /* Recommendations list */
+    .rec-item {
+      display: flex; gap: 10px; align-items: flex-start;
+      padding: 8px 0; border-bottom: 1px solid var(--border);
+    }
+    .rec-item:last-child { border-bottom: none; }
+
+    .rec-rank {
+      font-size: 11px; color: var(--text-dim); min-width: 16px;
+      text-align: right; margin-top: 2px;
+    }
+
+    .rec-body { flex: 1; min-width: 0; }
+
+    .rec-name {
+      font-size: 13px; font-weight: 600;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+
+    .rec-artist { font-size: 11px; color: var(--text-dim); }
+
+    .rec-tags { display: flex; gap: 3px; flex-wrap: wrap; margin-top: 4px; }
+
+    .rec-score {
+      font-size: 10px; color: var(--accent);
+      min-width: 40px; text-align: right; margin-top: 2px;
+    }
+
+    /* Graph stats */
+    .stats-grid {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+    }
+
+    .stat-box {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 6px; padding: 8px; text-align: center;
+    }
+
+    .stat-box .num {
+      font-size: 20px; font-weight: 700; color: var(--accent);
+    }
+
+    .stat-box .lbl {
+      font-size: 10px; color: var(--text-dim); text-transform: uppercase;
+      letter-spacing: .5px; margin-top: 2px;
+    }
+
+    /* Empty state */
+    .empty {
+      text-align: center; padding: 24px 0;
+      color: var(--text-dim); font-size: 13px; line-height: 1.6;
+    }
+
+    .spinner {
+      display: inline-block; width: 14px; height: 14px;
+      border: 2px solid var(--border); border-top-color: var(--accent);
+      border-radius: 50%; animation: spin .7s linear infinite;
+      vertical-align: middle; margin-right: 6px;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Graph canvas ─────────────────────────────────────── */
+    #graph-canvas {
+      grid-area: graph;
+      position: relative;
+    }
+
+    #vis-container {
+      width: 100%; height: 100%;
+    }
+
+    #graph-legend {
+      position: absolute; bottom: 16px; right: 16px;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 10px 14px;
+      font-size: 11px; color: var(--text-dim);
+      display: flex; flex-direction: column; gap: 4px;
+    }
+
+    .legend-item {
+      display: flex; align-items: center; gap: 6px;
+    }
+
+    .legend-dot {
+      width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
+    }
+
+    #graph-hint {
+      position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 20px; padding: 4px 14px;
+      font-size: 12px; color: var(--text-dim);
+      pointer-events: none;
+    }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    /* Login overlay */
+    #login-overlay {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,.85);
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      gap: 16px; z-index: 100;
+    }
+
+    #login-overlay.hidden { display: none; }
+
+    #login-overlay h1 {
+      font-size: 28px; color: var(--accent);
+    }
+
+    #login-overlay p {
+      color: var(--text-dim); max-width: 360px; text-align: center;
+    }
+  </style>
+</head>
+<body>
+
+<!-- Login overlay (shown if not authenticated) -->
+<div id="login-overlay">
+  <h1>SpotiGraph</h1>
+  <p>Connect your Spotify account to start building the Knowledge Graph and filling your queue with contextually related tracks.</p>
+  <a href="/login" class="btn btn-primary" style="font-size:15px;padding:12px 28px;">
+    Connect Spotify
+  </a>
+</div>
+
+<header>
+  <div class="logo">SpotiGraph <span>Knowledge Graph Queue</span></div>
+  <div class="spacer"></div>
+  <div class="status-pill" id="neo4j-status">
+    <span class="dot" id="neo4j-dot"></span> Neo4j
+  </div>
+  <div class="status-pill" id="spotify-status" style="margin-left:8px">
+    <span class="dot" id="spotify-dot"></span> Spotify
+  </div>
+</header>
+
+<aside>
+  <!-- Now playing -->
+  <div class="card">
+    <h3>Now Playing</h3>
+    <div id="now-playing-content">
+      <div class="empty">No track playing</div>
+    </div>
+  </div>
+
+  <!-- Actions -->
+  <div class="card">
+    <h3>Actions</h3>
+    <div class="btn-row">
+      <button class="btn btn-primary" id="btn-recommend">
+        Recommend
+      </button>
+      <button class="btn btn-primary" id="btn-queue" style="background:#4a90e2">
+        + Add to Queue
+      </button>
+      <button class="btn btn-secondary" id="btn-refresh-graph">
+        Refresh Graph
+      </button>
+    </div>
+    <div id="action-status" style="margin-top:8px;font-size:12px;color:var(--text-dim);min-height:16px;"></div>
+  </div>
+
+  <!-- Recommendations -->
+  <div class="card" style="flex:1">
+    <h3>Recommendations</h3>
+    <div id="rec-list">
+      <div class="empty">Run recommendation to see results</div>
+    </div>
+  </div>
+
+  <!-- Graph stats -->
+  <div class="card">
+    <h3>Graph Stats</h3>
+    <div class="stats-grid" id="stats-grid">
+      <div class="stat-box"><div class="num" id="stat-tracks">—</div><div class="lbl">Tracks</div></div>
+      <div class="stat-box"><div class="num" id="stat-artists">—</div><div class="lbl">Artists</div></div>
+      <div class="stat-box"><div class="num" id="stat-moods">—</div><div class="lbl">Moods</div></div>
+      <div class="stat-box"><div class="num" id="stat-concepts">—</div><div class="lbl">Concepts</div></div>
+    </div>
+  </div>
+</aside>
+
+<!-- Graph canvas -->
+<div id="graph-canvas">
+  <div id="vis-container"></div>
+  <div id="graph-hint">Click a node to explore • Scroll to zoom</div>
+  <div id="graph-legend">
+    <strong style="color:var(--text);margin-bottom:4px">Node types</strong>
+    <div class="legend-item"><div class="legend-dot" style="background:#1db954"></div> Track</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#4a90e2"></div> Artist</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#e2844a"></div> Genre</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#c07ef7"></div> Mood</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#7eb8f7"></div> Concept</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#f7d57e"></div> Era</div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+// ── vis.js network instance ─────────────────────────────────────────────────
+let network = null;
+const visNodes = new vis.DataSet();
+const visEdges = new vis.DataSet();
+
+const NODE_COLORS = {
+  Track:   { background: "#1db954", border: "#17a349", font: { color: "#000", size: 11 } },
+  Artist:  { background: "#4a90e2", border: "#3378c5", font: { color: "#fff", size: 10 } },
+  Genre:   { background: "#e2844a", border: "#c8693a", font: { color: "#fff", size: 10 } },
+  Mood:    { background: "#c07ef7", border: "#a765e2", font: { color: "#fff", size: 10 } },
+  Concept: { background: "#7eb8f7", border: "#5a9fe4", font: { color: "#000", size: 10 } },
+  Era:     { background: "#f7d57e", border: "#e4c065", font: { color: "#000", size: 10 } },
+};
+
+function initNetwork() {
+  const container = document.getElementById("vis-container");
+  const options = {
+    physics: {
+      enabled: true,
+      stabilization: { iterations: 100 },
+      barnesHut: { gravitationalConstant: -3000, springLength: 120 },
+    },
+    edges: {
+      color: { color: "#444", highlight: "#1db954" },
+      width: 1.5,
+      smooth: { type: "continuous" },
+      font: { color: "#666", size: 9 },
+      arrows: { to: { enabled: true, scaleFactor: 0.5 } },
+    },
+    nodes: { shape: "dot", size: 14 },
+    interaction: { hover: true, tooltipDelay: 200 },
+  };
+  network = new vis.Network(container, { nodes: visNodes, edges: visEdges }, options);
+
+  network.on("click", (params) => {
+    if (params.nodes.length > 0) {
+      const nodeId = params.nodes[0];
+      const node = visNodes.get(nodeId);
+      if (node && node.label === "Track" && node.spotify_id) {
+        loadNeighborhood(node.spotify_id);
+      }
+    }
+  });
+}
+
+// ── API helpers ─────────────────────────────────────────────────────────────
+async function api(path) {
+  const resp = await fetch(path);
+  if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}`);
+  return resp.json();
+}
+
+async function apiPost(path) {
+  const resp = await fetch(path, { method: "POST" });
+  if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}`);
+  return resp.json();
+}
+
+function setStatus(msg) {
+  document.getElementById("action-status").textContent = msg;
+}
+
+// ── Health / Auth check ─────────────────────────────────────────────────────
+async function checkHealth() {
+  try {
+    const h = await api("/health");
+    setDot("neo4j-dot", h.neo4j === "ok");
+    setDot("spotify-dot", h.spotify_authenticated);
+    if (!h.spotify_authenticated) {
+      document.getElementById("login-overlay").classList.remove("hidden");
+    } else {
+      document.getElementById("login-overlay").classList.add("hidden");
+    }
+  } catch {
+    setDot("neo4j-dot", false);
+    setDot("spotify-dot", false);
+  }
+}
+
+function setDot(id, ok) {
+  const el = document.getElementById(id);
+  el.className = "dot " + (ok ? "ok" : "err");
+}
+
+// ── Now playing ─────────────────────────────────────────────────────────────
+let currentTrackId = null;
+
+async function refreshNowPlaying() {
+  try {
+    const data = await api("/currently-playing");
+    const el = document.getElementById("now-playing-content");
+    if (!data.playing || !data.track) {
+      el.innerHTML = `<div class="empty">No track playing</div>`;
+      currentTrackId = null;
+      return;
+    }
+    const t = data.track;
+    const genres = (t.genres || []).slice(0, 3);
+    const genreTags = genres.map(g => `<span class="tag genre">${g}</span>`).join("");
+    const img = t.image_url
+      ? `<img class="album-art" src="${t.image_url}" alt="album art" />`
+      : `<div class="album-art"></div>`;
+
+    el.innerHTML = `
+      <div class="now-playing">
+        ${img}
+        <div class="track-meta" style="min-width:0;flex:1">
+          <div class="track-name" title="${esc(t.name)}">${esc(t.name)}</div>
+          <div class="track-artist">${esc((t.artist_names || []).join(", "))}</div>
+          <div class="track-genres">${genreTags}</div>
+        </div>
+      </div>`;
+
+    // Auto-load graph when track changes
+    if (t.spotify_id !== currentTrackId) {
+      currentTrackId = t.spotify_id;
+      await loadNeighborhood(t.spotify_id);
+    }
+  } catch (e) {
+    // silently ignore — health check already shows status
+  }
+}
+
+// ── Recommendations ─────────────────────────────────────────────────────────
+async function runRecommend(queue = false) {
+  const el = document.getElementById("rec-list");
+  el.innerHTML = `<div class="empty"><span class="spinner"></span>Traversing graph…</div>`;
+  setStatus("Running recommendation engine…");
+
+  try {
+    const endpoint = queue ? "/recommend/queue?limit=5" : "/recommend?limit=5";
+    const data = queue ? await apiPost(endpoint) : await api(endpoint);
+
+    if (!data.recommendations || data.recommendations.length === 0) {
+      el.innerHTML = `<div class="empty">No candidates found.<br>Try ingesting more tracks first.</div>`;
+      setStatus("No recommendations — graph may be sparse");
+      return;
+    }
+
+    el.innerHTML = data.recommendations.map((r, i) => {
+      const moodTags    = (r.reason.shared_moods    || []).map(m => `<span class="tag mood">${m}</span>`).join("");
+      const tempoTags   = (r.reason.shared_tempos   || []).map(t => `<span class="tag concept">${t}</span>`).join("");
+      const textureTags = (r.reason.shared_textures || []).map(x => `<span class="tag concept">${x}</span>`).join("");
+      const genreTags   = (r.reason.shared_genres   || []).map(g => `<span class="tag genre">${g}</span>`).join("");
+      const eraTags     = (r.reason.shared_eras     || []).map(e => `<span class="tag" style="background:#2a1a1a;color:#f7a">${e}</span>`).join("");
+      const artistBadge = r.reason.via_related_artist
+        ? `<span class="tag" style="background:#1a2a3a;color:#7eb8f7">related artist</span>` : "";
+
+      return `
+        <div class="rec-item">
+          <div class="rec-rank">${i + 1}</div>
+          <div class="rec-body">
+            <div class="rec-name">${esc(r.track.name)}</div>
+            <div class="rec-artist">${esc((r.track.artist_names || []).join(", "))}</div>
+            <div class="rec-tags">
+              ${moodTags}${tempoTags}${textureTags}${genreTags}${eraTags}${artistBadge}
+            </div>
+          </div>
+          <div class="rec-score">${r.reason.score.toFixed(1)}</div>
+        </div>`;
+    }).join("");
+
+    // Refresh graph after successful recommendation (graph now has new nodes)
+    if (currentTrackId) await loadNeighborhood(currentTrackId);
+    await refreshStats();
+
+    const queued = data.added_to_queue ? " + added to queue" : "";
+    setStatus(`${data.recommendations.length} recommendations${queued}`);
+  } catch (e) {
+    el.innerHTML = `<div class="empty">Error: ${e.message}</div>`;
+    setStatus("Recommendation failed — check console");
+    console.error(e);
+  }
+}
+
+// ── Graph visualization ──────────────────────────────────────────────────────
+async function loadNeighborhood(trackId) {
+  if (!trackId) return;
+  try {
+    const data = await api(`/graph/neighborhood/${trackId}`);
+    renderGraph(data.nodes || [], data.edges || []);
+  } catch (e) {
+    console.warn("Could not load graph neighborhood:", e.message);
+  }
+}
+
+function renderGraph(rawNodes, rawEdges) {
+  visNodes.clear();
+  visEdges.clear();
+
+  const nodeData = rawNodes.map(n => {
+    const style = NODE_COLORS[n.label] || { background: "#666", border: "#555", font: { color: "#fff", size: 10 } };
+    return {
+      id: n.node_id,
+      label: n.title || n.label,
+      group: n.label,
+      color: { background: style.background, border: style.border },
+      font: style.font,
+      title: `${n.label}: ${n.title}`,
+      spotify_id: n.spotify_id,
+      size: n.label === "Track" ? 18 : 12,
+    };
+  });
+
+  const edgeData = rawEdges.map((e, i) => ({
+    id: i,
+    from: e.source,
+    to: e.target,
+    label: e.rel_type.replace(/_/g, " ").toLowerCase(),
+  }));
+
+  visNodes.add(nodeData);
+  visEdges.add(edgeData);
+  if (network) network.fit({ animation: true });
+}
+
+async function refreshStats() {
+  try {
+    const s = await api("/graph/stats");
+    document.getElementById("stat-tracks").textContent   = s.tracks   ?? "—";
+    document.getElementById("stat-artists").textContent  = s.artists  ?? "—";
+    document.getElementById("stat-moods").textContent    = s.moods    ?? "—";
+    document.getElementById("stat-concepts").textContent = s.concepts ?? "—";
+  } catch { /* ignore */ }
+}
+
+// ── Utils ────────────────────────────────────────────────────────────────────
+function esc(str) {
+  return String(str || "")
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+// ── Wire up buttons ──────────────────────────────────────────────────────────
+document.getElementById("btn-recommend").addEventListener("click", () => runRecommend(false));
+document.getElementById("btn-queue").addEventListener("click",     () => runRecommend(true));
+document.getElementById("btn-refresh-graph").addEventListener("click", async () => {
+  if (currentTrackId) await loadNeighborhood(currentTrackId);
+  await refreshStats();
+  setStatus("Graph refreshed");
+});
+
+// ── Boot ─────────────────────────────────────────────────────────────────────
+(async function boot() {
+  initNetwork();
+  await checkHealth();
+  await refreshNowPlaying();
+  await refreshStats();
+
+  // Poll for now-playing updates every 10s
+  setInterval(async () => {
+    await refreshNowPlaying();
+    await checkHealth();
+  }, 10_000);
+
+  // Refresh stats every 30s
+  setInterval(refreshStats, 30_000);
+})();
+</script>
+</body>
+</html>
