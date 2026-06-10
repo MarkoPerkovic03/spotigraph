@@ -343,6 +343,7 @@ class GraphClient:
                      collect(DISTINCT se.label) AS seedEras,
                      collect(DISTINCT ra.name)  AS similarArtistNames
 
+                // Candidates: via shared semantic nodes OR directly via SONICALLY_SIMILAR
                 MATCH (candidate:Track)
                 WHERE candidate.spotify_id <> $track_id
                   AND NOT candidate.spotify_id IN $exclude_ids
@@ -355,15 +356,16 @@ class GraphClient:
                   WHERE ce.label IN seedEras
                 OPTIONAL MATCH (candidate)-[:BY]->(ca:Artist)
                   WHERE ca.name IN similarArtistNames
+                OPTIONAL MATCH (seed)-[:SONICALLY_SIMILAR]->(candidate)
 
                 WITH candidate,
                      collect(DISTINCT cg.name)  AS sharedGenres,
                      collect(DISTINCT cm.name)  AS sharedMoods,
                      collect(DISTINCT ce.label) AS sharedEras,
-                     count(DISTINCT ca)         AS relatedArtistHits
+                     count(DISTINCT ca)         AS relatedArtistHits,
+                     count(DISTINCT candidate)  AS directSimilar
 
-                // Require at least one genre OR mood match — artist bonus alone is not enough
-                WHERE size(sharedGenres) + size(sharedMoods) > 0
+                WHERE size(sharedGenres) + size(sharedMoods) + relatedArtistHits + directSimilar > 0
 
                 RETURN DISTINCT
                     candidate.spotify_id   AS spotify_id,
@@ -375,8 +377,9 @@ class GraphClient:
                     sharedMoods            AS shared_moods,
                     sharedEras             AS shared_eras,
                     relatedArtistHits > 0  AS via_related_artist,
+                    directSimilar > 0      AS direct_similar,
                     size(sharedGenres) + size(sharedMoods) AS overlap_count
-                ORDER BY overlap_count DESC
+                ORDER BY overlap_count DESC, directSimilar DESC
                 LIMIT $limit
                 """,
                 track_id=track_id,

@@ -55,6 +55,13 @@ _SKIP_TAGS = {
     "music", "songs", "tracks", "",
 }
 
+# Generic genre tags — only kept if no specific tags exist
+_GENERIC_GENRE_TAGS = {
+    "rap", "hip-hop", "hip hop", "hiphop", "pop", "rock", "electronic",
+    "r&b", "rnb", "soul", "jazz", "indie", "alternative", "metal",
+    "dance", "house", "techno", "classical", "country", "folk",
+}
+
 
 class LastFmSettings(BaseSettings):
     lastfm_api_key: str = ""
@@ -190,8 +197,16 @@ def _classify_tags(raw_tags: list[dict], limit: int = 10) -> dict[str, list[str]
         else:
             genre.append(name)
 
+    # If specific genre tags exist, drop the generic ones
+    # e.g. if "deutschrap" exists, skip "rap" and "hip-hop"
+    specific_genres = [g for g in genre if g not in _GENERIC_GENRE_TAGS]
+    if specific_genres:
+        final_genres = specific_genres[:limit]
+    else:
+        final_genres = genre[:limit]   # keep generic if nothing specific found
+
     return {
-        "genre": genre[:limit],
+        "genre": final_genres,
         "mood":  mood[:5],
         "era":   era[:3],
     }

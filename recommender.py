@@ -96,9 +96,10 @@ class Recommender:
                 added_to_queue=False,
             )
 
-        # Genre frequencies for TF-IDF weighting
+        # Genre frequencies for TF-IDF weighting — N = actual track count in graph
         genre_freqs = await self._graph.get_genre_frequencies()
-        total_tracks = max(sum(genre_freqs.values()) // max(len(genre_freqs), 1), 1)
+        stats = await self._graph.get_stats()
+        total_tracks = max(int(stats.get("tracks", 1)), max(genre_freqs.values(), default=1))
         seed_popularity = source.popularity or 50
 
         # Score with TF-IDF + multi-signal + popularity
@@ -218,6 +219,10 @@ class Recommender:
                     if not await self._graph.is_enriched(t.spotify_id):
                         r = await enrich(t, self._lastfm)
                         await self._graph.apply_enrichment(t.spotify_id, r)
+                    # Direct edge: seed track → similar artist's track
+                    await self._graph.create_sonically_similar(
+                        track.spotify_id, t.spotify_id, score=weight
+                    )
                     ingested += 1
 
                 # Create SIMILAR_TO edge (artist_name → sim_name)
@@ -269,10 +274,11 @@ def _score_candidates(
        → Playing underground music → mainstream hits are penalized.
     """
     for c in candidates:
-        shared_genres  = c.get("shared_genres")  or []
-        shared_moods   = c.get("shared_moods")   or []
-        shared_eras    = c.get("shared_eras")     or []
-        via_artist     = bool(c.get("via_related_artist"))
+        shared_genres   = c.get("shared_genres")   or []
+        shared_moods    = c.get("shared_moods")    or []
+        shared_eras     = c.get("shared_eras")     or []
+        via_artist      = bool(c.get("via_related_artist"))
+        direct_similar  = bool(c.get("direct_similar"))
         cand_popularity = int(c.get("popularity") or 50)
 
         # 1. TF-IDF genre score
@@ -288,13 +294,16 @@ def _score_candidates(
         # 3. Era score (minor signal)
         era_score = len(shared_eras) * 0.5
 
-        # 4. Multi-signal bonus
-        active_signals = sum([genre_score > 0, mood_score > 0, via_artist])
+        # 4. Direct similarity bonus (SONICALLY_SIMILAR edge = strong direct connection)
+        direct_bonus = 3.0 if direct_similar else 0.0
+
+        # 5. Multi-signal bonus
+        active_signals = sum([genre_score > 0, mood_score > 0, via_artist, direct_similar])
         multi_bonus = (active_signals - 1) * 1.5 if active_signals > 1 else 0.0
 
-        # 5. Popularity penalty
-        pop_penalty = abs(seed_popularity - cand_popularity) / 100.0 * 0.8
+        # 5. Popularity penalty (gentle — only penalizes extreme mismatches)
+        pop_penalty = abs(seed_popularity - cand_popularity) / 100.0 * 0.3
 
-        c["score"] = genre_score + mood_score + era_score + multi_bonus - pop_penalty
+        c["score"] = genre_score + mood_score + era_score + direct_bonus + multi_bonus - pop_penalty
 
     return sorted(candidates, key=lambda x: x["score"], reverse=True)
