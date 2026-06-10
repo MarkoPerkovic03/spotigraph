@@ -30,6 +30,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from pydantic_settings import BaseSettings
 
+from deezer_client import DeezerClient
 from graph_client import GraphClient
 from lastfm_client import LastFmClient
 from models import HealthResponse, RecommendationResponse
@@ -63,6 +64,7 @@ settings = AppSettings()
 graph: Optional[GraphClient] = None
 spotify: Optional[SpotifyClient] = None
 lastfm: Optional[LastFmClient] = None
+deezer: Optional[DeezerClient] = None
 recommender_svc: Optional[Recommender] = None
 _http_client_ctx = None       # keeps the SpotifyClient context open
 _polling_task: Optional[asyncio.Task] = None
@@ -75,7 +77,7 @@ _last_track_id: Optional[str] = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global graph, spotify, lastfm, recommender_svc, _http_client_ctx, _polling_task
+    global graph, spotify, lastfm, deezer, recommender_svc, _http_client_ctx, _polling_task
 
     # Boot services
     graph = GraphClient()
@@ -93,7 +95,13 @@ async def lifespan(app: FastAPI):
 
     lastfm = LastFmClient()
     await lastfm.__aenter__()
-    recommender_svc = Recommender(graph=graph, spotify=spotify, lastfm=lastfm)
+
+    deezer = DeezerClient()
+    await deezer.__aenter__()
+
+    recommender_svc = Recommender(
+        graph=graph, spotify=spotify, lastfm=lastfm, deezer=deezer
+    )
 
     logger.info("SpotiGraph started on http://%s:%d", settings.app_host, settings.app_port)
 
@@ -111,6 +119,8 @@ async def lifespan(app: FastAPI):
         await spotify.__aexit__(None, None, None)
     if lastfm:
         await lastfm.__aexit__(None, None, None)
+    if deezer:
+        await deezer.__aexit__(None, None, None)
     if graph:
         await graph.close()
     logger.info("SpotiGraph shut down cleanly")
@@ -278,6 +288,15 @@ async def test_lastfm(artist_name: str):
     tags = await lastfm.get_artist_tags(artist_name)
     similar = await lastfm.get_similar_artists(artist_name, limit=5)
     return {"artist": artist_name, "tags": tags, "similar_artists": similar}
+
+
+@app.get("/admin/test-deezer/{artist_name}/{track_name}", tags=["Admin"])
+async def test_deezer(artist_name: str, track_name: str):
+    """Test the Deezer audio proxy (bpm + loudness) for an artist/track pair."""
+    if deezer is None:
+        raise HTTPException(503, "Deezer client not initialized")
+    proxy = await deezer.get_audio_proxy(artist_name, track_name)
+    return {"artist": artist_name, "track": track_name, "audio_proxy": proxy}
 
 
 # ---------------------------------------------------------------------------

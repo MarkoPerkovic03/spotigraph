@@ -33,6 +33,7 @@ import logging
 import math
 from typing import Optional
 
+from deezer_client import DeezerClient
 from enrichment import enrich
 from graph_client import GraphClient
 from lastfm_client import LastFmClient
@@ -49,6 +50,10 @@ logger = logging.getLogger(__name__)
 MAX_SIMILAR_ARTISTS = 5
 MAX_TRACKS_PER_ARTIST = 10
 
+# Normalization for the Deezer energy proxy (so bpm and loudness are comparable)
+_BPM_NORM = 200.0        # typical bpm span 60–200
+_LOUDNESS_NORM = 20.0    # Deezer gain in dB, typically -20..0
+
 
 class Recommender:
     def __init__(
@@ -56,10 +61,12 @@ class Recommender:
         graph: GraphClient,
         spotify: SpotifyClient,
         lastfm: LastFmClient,
+        deezer: Optional[DeezerClient] = None,
     ) -> None:
         self._graph   = graph
         self._spotify = spotify
         self._lastfm  = lastfm
+        self._deezer  = deezer
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -105,6 +112,9 @@ class Recommender:
         # Score with TF-IDF + multi-signal + popularity
         scored = _score_candidates(candidates_raw, genre_freqs, total_tracks, seed_popularity)
 
+        # Measurement: log current genre-driven ranking vs. vibe-driven ranking
+        _log_vibe_comparison(source, scored)
+
         # Diversity: max 1 track per artist
         top: list[dict] = []
         seen_artists: set[str] = set()
@@ -137,6 +147,12 @@ class Recommender:
                     shared_eras=list(c.get("shared_eras") or []),
                     via_related_artist=bool(c.get("via_related_artist")),
                     score=round(float(c.get("score", 0)), 2),
+                    genre_score=round(float(c.get("genre_score", 0)), 2),
+                    vibe_distance=c.get("vibe_distance"),
+                    seed_bpm=c.get("seed_bpm") or None,
+                    cand_bpm=c.get("cand_bpm") or None,
+                    seed_loudness=c.get("seed_loudness") or None,
+                    cand_loudness=c.get("cand_loudness") or None,
                 ),
             ))
 
@@ -173,7 +189,7 @@ class Recommender:
         await self._graph.upsert_track(track)
 
         if not await self._graph.is_enriched(track.spotify_id):
-            result = await enrich(track, self._lastfm)
+            result = await enrich(track, self._lastfm, self._deezer)
             await self._graph.apply_enrichment(track.spotify_id, result)
             logger.info("Last.fm enrichment result: %s", result.model_dump())
             logger.info(
@@ -217,7 +233,7 @@ class Recommender:
                 for t in results:
                     await self._graph.upsert_track(t)
                     if not await self._graph.is_enriched(t.spotify_id):
-                        r = await enrich(t, self._lastfm)
+                        r = await enrich(t, self._lastfm, self._deezer)
                         await self._graph.apply_enrichment(t.spotify_id, r)
                     # Direct edge: seed track → similar artist's track
                     await self._graph.create_sonically_similar(
@@ -236,7 +252,7 @@ class Recommender:
         for t in saved:
             await self._graph.upsert_track(t)
             if not await self._graph.is_enriched(t.spotify_id):
-                r = await enrich(t, self._lastfm)
+                r = await enrich(t, self._lastfm, self._deezer)
                 await self._graph.apply_enrichment(t.spotify_id, r)
             ingested += 1
 
@@ -306,4 +322,76 @@ def _score_candidates(
 
         c["score"] = genre_score + mood_score + era_score + direct_bonus + multi_bonus - pop_penalty
 
+        # Measurement only — NOT yet folded into `score` ("erst messen").
+        c["genre_score"] = round(genre_score, 3)
+        c["vibe_distance"] = _vibe_distance(
+            c.get("seed_bpm"), c.get("seed_loudness"),
+            c.get("cand_bpm"), c.get("cand_loudness"),
+        )
+
     return sorted(candidates, key=lambda x: x["score"], reverse=True)
+
+
+def _vibe_distance(
+    seed_bpm: Optional[float],
+    seed_loudness: Optional[float],
+    cand_bpm: Optional[float],
+    cand_loudness: Optional[float],
+) -> Optional[float]:
+    """
+    Normalized RMS distance in the Deezer energy proxy (tempo + loudness).
+
+    0.0 = identical energy, higher = more different. Returns None when no
+    audio dimension is shared (missing Deezer data). 0.0 values are treated
+    as missing: bpm 0 means "unknown", and loudness 0.0 is the node default
+    (real Deezer gain is virtually always negative).
+    """
+    dims: list[float] = []
+    if seed_bpm and cand_bpm:
+        dims.append(((seed_bpm - cand_bpm) / _BPM_NORM) ** 2)
+    if seed_loudness and cand_loudness:
+        dims.append(((seed_loudness - cand_loudness) / _LOUDNESS_NORM) ** 2)
+    if not dims:
+        return None
+    return round(math.sqrt(sum(dims) / len(dims)), 3)
+
+
+def _log_vibe_comparison(source: TrackInfo, scored: list[dict], top_n: int = 15) -> None:
+    """
+    Log the current genre-driven ranking next to a vibe-driven ranking so we
+    can eyeball whether high-genre-score tracks actually share the seed's
+    energy. Pure measurement — does not affect what gets recommended.
+    """
+    top = scored[:top_n]
+    with_vibe = [c for c in top if c.get("vibe_distance") is not None]
+    coverage = f"{len(with_vibe)}/{len(top)} have Deezer audio"
+
+    logger.info(
+        "── Vibe measurement for '%s' (seed bpm=%s loud=%s) — %s ──",
+        source.name,
+        _fmt(top[0].get("seed_bpm")) if top else "?",
+        _fmt(top[0].get("seed_loudness")) if top else "?",
+        coverage,
+    )
+    logger.info("  genre rank | %-30s | genre | vibeΔ", "track")
+    for i, c in enumerate(top, 1):
+        vd = c.get("vibe_distance")
+        logger.info(
+            "  G%-2d        | %-30s | %5.2f | %s",
+            i, (c.get("name") or "")[:30], float(c.get("genre_score", 0.0)),
+            f"{vd:.3f}" if vd is not None else " n/a",
+        )
+
+    by_vibe = sorted(with_vibe, key=lambda x: x["vibe_distance"])
+    if by_vibe:
+        logger.info("  vibe rank (closest energy first):")
+        for i, c in enumerate(by_vibe[:10], 1):
+            logger.info(
+                "  V%-2d        | %-30s | %5.2f | %.3f",
+                i, (c.get("name") or "")[:30],
+                float(c.get("genre_score", 0.0)), c["vibe_distance"],
+            )
+
+
+def _fmt(v: Optional[float]) -> str:
+    return f"{v:.1f}" if v else "n/a"

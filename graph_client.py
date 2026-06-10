@@ -124,18 +124,12 @@ class GraphClient:
                     t.artist_names  = $props.artist_names,
                     t.genres        = $props.genres,
                     t.popularity    = $props.popularity,
-                    t.release_year  = $props.release_year,
-                    t.danceability  = $props.danceability,
-                    t.energy        = $props.energy,
-                    t.valence       = $props.valence,
-                    t.tempo         = $props.tempo,
-                    t.acousticness  = $props.acousticness,
-                    t.instrumentalness = $props.instrumentalness,
-                    t.liveness      = $props.liveness,
-                    t.speechiness   = $props.speechiness,
-                    t.loudness      = $props.loudness,
-                    t.key           = $props.key,
-                    t.mode          = $props.mode
+                    t.release_year  = $props.release_year
+                    // NOTE: audio features (tempo/loudness/energy/...) are
+                    // deliberately NOT updated on match. Spotify no longer
+                    // supplies them, so $props carries only zero defaults —
+                    // overwriting here would clobber Deezer-enriched values
+                    // on every re-upsert (and is_enriched then skips refetch).
                 """,
                 spotify_id=track.spotify_id,
                 props=props,
@@ -205,6 +199,20 @@ class GraphClient:
                     MERGE (t)-[:BELONGS_TO_ERA]->(e)
                     """,
                     label=result.era_label, tid=track_id,
+                )
+
+            # Deezer audio proxy (energy signal) — reuse existing node props.
+            # Only overwrite when we actually got a value, so a failed Deezer
+            # lookup never clobbers a previously stored proxy.
+            if result.bpm is not None:
+                await session.run(
+                    "MATCH (t:Track {spotify_id: $tid}) SET t.tempo = $bpm",
+                    tid=track_id, bpm=result.bpm,
+                )
+            if result.loudness is not None:
+                await session.run(
+                    "MATCH (t:Track {spotify_id: $tid}) SET t.loudness = $loudness",
+                    tid=track_id, loudness=result.loudness,
                 )
 
             await session.run(
@@ -338,6 +346,8 @@ class GraphClient:
                 OPTIONAL MATCH (seed)-[:BY]->(sa:Artist)-[:SIMILAR_TO*1..2]-(ra:Artist)
 
                 WITH seed,
+                     seed.tempo                 AS seedBpm,
+                     seed.loudness              AS seedLoudness,
                      collect(DISTINCT sg.name)  AS seedGenres,
                      collect(DISTINCT sm.name)  AS seedMoods,
                      collect(DISTINCT se.label) AS seedEras,
@@ -358,7 +368,7 @@ class GraphClient:
                   WHERE ca.name IN similarArtistNames
                 OPTIONAL MATCH (seed)-[:SONICALLY_SIMILAR]->(candidate)
 
-                WITH candidate,
+                WITH candidate, seedBpm, seedLoudness,
                      collect(DISTINCT cg.name)  AS sharedGenres,
                      collect(DISTINCT cm.name)  AS sharedMoods,
                      collect(DISTINCT ce.label) AS sharedEras,
@@ -367,12 +377,19 @@ class GraphClient:
 
                 WHERE size(sharedGenres) + size(sharedMoods) + relatedArtistHits + directSimilar > 0
 
-                RETURN DISTINCT
+                // No DISTINCT needed — the aggregation above already yields one
+                // row per candidate. DISTINCT here would also make the raw
+                // `directSimilar` var inaccessible to ORDER BY (Neo4j 42N44).
+                RETURN
                     candidate.spotify_id   AS spotify_id,
                     candidate.name         AS name,
                     candidate.artist_names AS artist_names,
                     candidate.genres       AS genres,
                     candidate.popularity   AS popularity,
+                    candidate.tempo        AS cand_bpm,
+                    candidate.loudness     AS cand_loudness,
+                    seedBpm                AS seed_bpm,
+                    seedLoudness           AS seed_loudness,
                     sharedGenres           AS shared_genres,
                     sharedMoods            AS shared_moods,
                     sharedEras             AS shared_eras,

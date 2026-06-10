@@ -546,6 +546,13 @@ async function runRecommend(queue = false) {
       const artistBadge = r.reason.via_related_artist
         ? `<span class="tag" style="background:#1a2a3a;color:#7eb8f7">related artist</span>` : "";
 
+      // Measurement badges: genre-only score + Deezer vibe (energy) distance
+      const genreBadge = (typeof r.reason.genre_score === "number")
+        ? `<span class="tag" style="background:#1a2a1a;color:#9d9">genre ${r.reason.genre_score.toFixed(1)}</span>` : "";
+      const vibeBadge = (r.reason.vibe_distance != null)
+        ? `<span class="tag" style="background:#2a1a2a;color:#d9d">vibe Δ ${r.reason.vibe_distance.toFixed(2)}</span>`
+        : `<span class="tag" style="background:#222;color:#777">vibe n/a</span>`;
+
       const spotifyUrl = r.track.external_url || `https://open.spotify.com/track/${r.track.spotify_id}`;
       return `
         <div class="rec-item" style="cursor:pointer" onclick="window.open('${spotifyUrl}','_blank')" title="Open in Spotify">
@@ -554,7 +561,7 @@ async function runRecommend(queue = false) {
             <div class="rec-name">${esc(r.track.name)}</div>
             <div class="rec-artist">${esc((r.track.artist_names || []).join(", "))}</div>
             <div class="rec-tags">
-              ${moodTags}${genreTags}${eraTags}${artistBadge}
+              ${moodTags}${genreTags}${eraTags}${artistBadge}${genreBadge}${vibeBadge}
             </div>
           </div>
           <div class="rec-score">${r.reason.score.toFixed(1)}</div>

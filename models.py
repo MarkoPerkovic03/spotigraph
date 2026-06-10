@@ -65,6 +65,9 @@ class EnrichmentResult(BaseModel):
     genre_tags: list[str] = Field(default_factory=list)
     mood_tags:  list[str] = Field(default_factory=list)
     era_label:  str = ""
+    # Deezer audio proxy (energy signal). None when unavailable.
+    bpm:        Optional[float] = None   # tempo  (Deezer bpm; 0/missing → None)
+    loudness:   Optional[float] = None   # dB     (Deezer gain)
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +104,14 @@ class RecommendationReason(BaseModel):
     shared_eras: list[str] = Field(default_factory=list)
     via_related_artist: bool = False
     score: float = 0.0
+    # Measurement fields — let us compare the genre-driven score against the
+    # new Deezer vibe (energy) distance side-by-side before re-weighting.
+    genre_score: float = 0.0
+    vibe_distance: Optional[float] = None   # 0 = identical vibe; None = no audio data
+    seed_bpm: Optional[float] = None
+    cand_bpm: Optional[float] = None
+    seed_loudness: Optional[float] = None
+    cand_loudness: Optional[float] = None
 
 
 class Recommendation(BaseModel):

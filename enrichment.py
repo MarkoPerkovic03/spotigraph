@@ -8,6 +8,9 @@ This replaces Spotify's restricted audio-features and genre endpoints.
 
 from __future__ import annotations
 
+from typing import Optional
+
+from deezer_client import DeezerClient
 from lastfm_client import LastFmClient
 from models import EnrichmentResult, TrackInfo
 
@@ -31,14 +34,20 @@ def _era_label(release_year: int | None) -> str:
 # Public API
 # ---------------------------------------------------------------------------
 
-async def enrich(track: TrackInfo, lastfm: LastFmClient) -> EnrichmentResult:
+async def enrich(
+    track: TrackInfo,
+    lastfm: LastFmClient,
+    deezer: Optional[DeezerClient] = None,
+) -> EnrichmentResult:
     """
-    Enrich a track with Last.fm semantic tags + release year era label.
+    Enrich a track with Last.fm semantic tags + release year era label,
+    plus a Deezer audio proxy (bpm + loudness) when a Deezer client is given.
 
     Strategy:
     1. Try track-level tags first (most specific).
     2. Fall back to artist-level tags if track has no tags.
     3. Always compute era from release year.
+    4. If a Deezer client is provided, attach the bpm/loudness energy proxy.
     """
     artist_name = track.artist_names[0] if track.artist_names else ""
     era = _era_label(track.release_year)
@@ -58,8 +67,18 @@ async def enrich(track: TrackInfo, lastfm: LastFmClient) -> EnrichmentResult:
         genre_tags  = artist_tags["genre"]
         mood_tags   = artist_tags["mood"]
 
+    # Deezer audio proxy (energy signal) — optional, cached via enriched flag
+    bpm = loudness = None
+    if deezer is not None:
+        proxy = await deezer.get_audio_proxy(artist_name, track.name)
+        if proxy:
+            bpm = proxy.get("bpm")
+            loudness = proxy.get("loudness")
+
     return EnrichmentResult(
         genre_tags=genre_tags,
         mood_tags=mood_tags,
         era_label=era,
+        bpm=bpm,
+        loudness=loudness,
     )
