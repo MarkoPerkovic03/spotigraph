@@ -101,6 +101,7 @@ class TrackNode(BaseModel):
 class RecommendationReason(BaseModel):
     shared_genres: list[str] = Field(default_factory=list)
     shared_moods: list[str] = Field(default_factory=list)
+    shared_energy: list[str] = Field(default_factory=list)
     shared_eras: list[str] = Field(default_factory=list)
     via_related_artist: bool = False
     score: float = 0.0

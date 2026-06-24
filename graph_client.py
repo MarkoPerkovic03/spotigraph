@@ -8,17 +8,15 @@ Nodes:
             instrumentalness, liveness, speechiness, loudness, key, mode}
   Artist   {spotify_id, name}
   Genre    {name}
-  Mood     {name}   -- energy × valence bucket  (e.g. "euphoric", "somber")
-  Tempo    {name}   -- tempo × danceability bucket (e.g. "groovy", "fast-paced")
-  Texture  {name}   -- acousticness × instrumentalness (e.g. "acoustic-vocal")
+  Mood     {name}   -- Last.fm mood tag (e.g. "euphoric", "somber")
+  Energy   {name}   -- Deezer loudness/bpm bucket (e.g. "calm", "energetic")
   Era      {label}  -- release decade (e.g. "1990s", "contemporary")
 
 Relationships:
   (Track)-[:BY]->(Artist)
   (Track)-[:HAS_GENRE]->(Genre)
   (Track)-[:EVOKES]->(Mood)
-  (Track)-[:HAS_TEMPO]->(Tempo)
-  (Track)-[:HAS_TEXTURE]->(Texture)
+  (Track)-[:HAS_ENERGY]->(Energy)
   (Track)-[:BELONGS_TO_ERA]->(Era)
   (Artist)-[:SIMILAR_TO {weight: float}]->(Artist)
   (Track)-[:SONICALLY_SIMILAR {score: float}]->(Track)
@@ -36,6 +34,24 @@ from pydantic_settings import BaseSettings
 from models import AudioFeatures, EnrichmentResult, TrackInfo
 
 logger = logging.getLogger(__name__)
+
+
+def _energy_bucket(loudness: Optional[float], bpm: Optional[float] = None) -> Optional[str]:
+    """
+    Map the Deezer loudness (gain, dB) to a coarse energy bucket node.
+
+    Deezer gain is ~ -20..0 dB. We turn it into a graph-traversable "vibe"
+    dimension (replacing the dead Mood signal). bpm is accepted for future
+    refinement but is missing for most tracks, so loudness drives the bucket.
+    Returns None when there is no usable loudness (0.0 / None = unknown).
+    """
+    if not loudness:           # 0.0 (node default) or None → unknown
+        return None
+    if loudness >= -6:   return "intense"
+    if loudness >= -9:   return "energetic"
+    if loudness >= -12:  return "moderate"
+    if loudness >= -16:  return "calm"
+    return "very-calm"
 
 
 class Neo4jSettings(BaseSettings):
@@ -76,6 +92,7 @@ class GraphClient:
             "CREATE CONSTRAINT genre_name IF NOT EXISTS FOR (g:Genre)   REQUIRE g.name IS UNIQUE",
             "CREATE CONSTRAINT mood_name  IF NOT EXISTS FOR (m:Mood)    REQUIRE m.name IS UNIQUE",
             "CREATE CONSTRAINT era_label  IF NOT EXISTS FOR (e:Era)     REQUIRE e.label IS UNIQUE",
+            "CREATE CONSTRAINT energy_name IF NOT EXISTS FOR (en:Energy) REQUIRE en.name IS UNIQUE",
         ]
         indexes = [
             "CREATE INDEX track_name    IF NOT EXISTS FOR (t:Track) ON (t.name)",
@@ -215,6 +232,18 @@ class GraphClient:
                     tid=track_id, loudness=result.loudness,
                 )
 
+            # Energy bucket node (graph-native vibe dimension, from Deezer).
+            bucket = _energy_bucket(result.loudness, result.bpm)
+            if bucket:
+                await session.run(
+                    """
+                    MERGE (en:Energy {name: $name})
+                    WITH en MATCH (t:Track {spotify_id: $tid})
+                    MERGE (t)-[:HAS_ENERGY]->(en)
+                    """,
+                    name=bucket, tid=track_id,
+                )
+
             await session.run(
                 "MATCH (t:Track {spotify_id: $tid}) SET t.enriched = true",
                 tid=track_id,
@@ -327,59 +356,63 @@ class GraphClient:
         candidate_limit: int = 50,
     ) -> list[dict[str, Any]]:
         """
-        Find candidate tracks by traversing shared semantic nodes
-        (Mood, Tempo, Texture, Era, Genre) and artist similarity edges.
+        Weighted spreading activation from the seed track.
 
-        Scoring signals returned per candidate:
-          shared_moods, shared_tempos, shared_textures,
-          shared_genres, shared_eras, via_related_artist
+        Each candidate accumulates activation over weighted graph paths:
+          - shared Genre nodes        (Python weights by IDF)
+          - shared Energy buckets      (Python weights by IDF) — Deezer vibe
+          - shared Era                 (weak)
+          - artist similarity          (SIMILAR_TO weight × hop decay, max path)
+          - sonic edge                 (SONICALLY_SIMILAR.score)
+
+        Edge weights (not just booleans) are returned so the scorer can combine
+        them. artist_score / sonic_score use max() so the cross-product of the
+        OPTIONAL MATCHes never inflates them.
         """
         async with self._driver.session() as session:
             result = await session.run(
                 """
                 MATCH (seed:Track {spotify_id: $track_id})
 
-                // Collect seed's semantic labels
+                // Seed's semantic labels (1-hop)
                 OPTIONAL MATCH (seed)-[:HAS_GENRE]->(sg:Genre)
-                OPTIONAL MATCH (seed)-[:EVOKES]->(sm:Mood)
+                OPTIONAL MATCH (seed)-[:HAS_ENERGY]->(sen:Energy)
                 OPTIONAL MATCH (seed)-[:BELONGS_TO_ERA]->(se:Era)
-                OPTIONAL MATCH (seed)-[:BY]->(sa:Artist)-[:SIMILAR_TO*1..2]-(ra:Artist)
 
                 WITH seed,
                      seed.tempo                 AS seedBpm,
                      seed.loudness              AS seedLoudness,
                      collect(DISTINCT sg.name)  AS seedGenres,
-                     collect(DISTINCT sm.name)  AS seedMoods,
-                     collect(DISTINCT se.label) AS seedEras,
-                     collect(DISTINCT ra.name)  AS similarArtistNames
+                     collect(DISTINCT sen.name) AS seedEnergy,
+                     collect(DISTINCT se.label) AS seedEras
 
-                // Candidates: via shared semantic nodes OR directly via SONICALLY_SIMILAR
                 MATCH (candidate:Track)
                 WHERE candidate.spotify_id <> $track_id
                   AND NOT candidate.spotify_id IN $exclude_ids
 
                 OPTIONAL MATCH (candidate)-[:HAS_GENRE]->(cg:Genre)
                   WHERE cg.name IN seedGenres
-                OPTIONAL MATCH (candidate)-[:EVOKES]->(cm:Mood)
-                  WHERE cm.name IN seedMoods
+                OPTIONAL MATCH (candidate)-[:HAS_ENERGY]->(cen:Energy)
+                  WHERE cen.name IN seedEnergy
                 OPTIONAL MATCH (candidate)-[:BELONGS_TO_ERA]->(ce:Era)
                   WHERE ce.label IN seedEras
-                OPTIONAL MATCH (candidate)-[:BY]->(ca:Artist)
-                  WHERE ca.name IN similarArtistNames
-                OPTIONAL MATCH (seed)-[:SONICALLY_SIMILAR]->(candidate)
+                OPTIONAL MATCH (seed)-[ss:SONICALLY_SIMILAR]->(candidate)
+                // Weighted artist-similarity path: product of SIMILAR_TO weights
+                // divided by hop count (1 hop = full, 2 hops = halved).
+                OPTIONAL MATCH (seed)-[:BY]->(:Artist)-[rels:SIMILAR_TO*1..2]-(:Artist)<-[:BY]-(candidate)
 
                 WITH candidate, seedBpm, seedLoudness,
                      collect(DISTINCT cg.name)  AS sharedGenres,
-                     collect(DISTINCT cm.name)  AS sharedMoods,
+                     collect(DISTINCT cen.name) AS sharedEnergy,
                      collect(DISTINCT ce.label) AS sharedEras,
-                     count(DISTINCT ca)         AS relatedArtistHits,
-                     count(DISTINCT candidate)  AS directSimilar
+                     max(coalesce(ss.score, 0.0)) AS sonicScore,
+                     max(coalesce(
+                         reduce(w = 1.0, r IN rels | w * coalesce(r.weight, 0.5)) / size(rels),
+                         0.0)) AS artistScore
 
-                WHERE size(sharedGenres) + size(sharedMoods) + relatedArtistHits + directSimilar > 0
+                WHERE size(sharedGenres) + size(sharedEnergy) + size(sharedEras) > 0
+                   OR sonicScore > 0 OR artistScore > 0
 
-                // No DISTINCT needed — the aggregation above already yields one
-                // row per candidate. DISTINCT here would also make the raw
-                // `directSimilar` var inaccessible to ORDER BY (Neo4j 42N44).
                 RETURN
                     candidate.spotify_id   AS spotify_id,
                     candidate.name         AS name,
@@ -391,12 +424,14 @@ class GraphClient:
                     seedBpm                AS seed_bpm,
                     seedLoudness           AS seed_loudness,
                     sharedGenres           AS shared_genres,
-                    sharedMoods            AS shared_moods,
+                    sharedEnergy           AS shared_energy,
                     sharedEras             AS shared_eras,
-                    relatedArtistHits > 0  AS via_related_artist,
-                    directSimilar > 0      AS direct_similar,
-                    size(sharedGenres) + size(sharedMoods) AS overlap_count
-                ORDER BY overlap_count DESC, directSimilar DESC
+                    sonicScore             AS sonic_score,
+                    artistScore            AS artist_score,
+                    artistScore > 0        AS via_related_artist,
+                    sonicScore > 0         AS direct_similar,
+                    size(sharedGenres) + size(sharedEnergy) AS overlap_count
+                ORDER BY overlap_count DESC, artistScore DESC, sonicScore DESC
                 LIMIT $limit
                 """,
                 track_id=track_id,
@@ -419,6 +454,17 @@ class GraphClient:
                 """
             )
             return {r["genre"]: r["freq"] async for r in result}
+
+    async def get_energy_frequencies(self) -> dict[str, int]:
+        """Return {energy_bucket: track_count} — used for IDF weighting of energy."""
+        async with self._driver.session() as session:
+            result = await session.run(
+                """
+                MATCH (en:Energy)<-[:HAS_ENERGY]-(t:Track)
+                RETURN en.name AS energy, count(t) AS freq
+                """
+            )
+            return {r["energy"]: r["freq"] async for r in result}
 
     async def get_track_audio_features(self, track_id: str) -> Optional[dict[str, float]]:
         async with self._driver.session() as session:

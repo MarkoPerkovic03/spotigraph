@@ -370,19 +370,24 @@ let network = null;
 const visNodes = new vis.DataSet();
 const visEdges = new vis.DataSet();
 
+// Labels are drawn on the dark canvas, so all fonts are light with a dark
+// halo (strokeWidth/strokeColor) to stay readable over any background or edge.
+const _LABEL = (size, bold = false) => ({
+  color: "#f5f5f5", size, bold, strokeWidth: 4, strokeColor: "#0d0d0d",
+});
 const NODE_COLORS = {
-  Track:   { background: "#1db954", border: "#17a349", font: { color: "#000", size: 11, bold: false } },
-  Artist:  { background: "#4a90e2", border: "#3378c5", font: { color: "#fff", size: 10 } },
-  Genre:   { background: "#e2844a", border: "#c8693a", font: { color: "#fff", size: 10 } },
-  Mood:    { background: "#c07ef7", border: "#a765e2", font: { color: "#fff", size: 10 } },
-  Concept: { background: "#7eb8f7", border: "#5a9fe4", font: { color: "#000", size: 10 } },
-  Era:     { background: "#f7d57e", border: "#e4c065", font: { color: "#000", size: 10 } },
+  Track:   { background: "#1db954", border: "#3ee87d", font: _LABEL(12) },
+  Artist:  { background: "#4a90e2", border: "#7fb3ff", font: _LABEL(11) },
+  Genre:   { background: "#e2844a", border: "#ffaa6e", font: _LABEL(11) },
+  Mood:    { background: "#c07ef7", border: "#d9a8ff", font: _LABEL(11) },
+  Concept: { background: "#7eb8f7", border: "#a8d2ff", font: _LABEL(11) },
+  Era:     { background: "#f7d57e", border: "#ffe9a8", font: _LABEL(11) },
 };
 
 // Seed track node style (currently playing)
 const SEED_STYLE = {
   background: "#ffffff", border: "#1db954",
-  font: { color: "#000", size: 13, bold: true },
+  font: _LABEL(14, true),
   size: 28, borderWidth: 3,
 };
 
@@ -401,7 +406,7 @@ function initNetwork() {
       },
     },
     edges: {
-      color: { color: "#333", highlight: "#1db954", hover: "#555" },
+      color: { color: "#6a6a6a", highlight: "#1db954", hover: "#9a9a9a" },
       width: 1,
       smooth: { type: "dynamic" },
       arrows: { to: { enabled: true, scaleFactor: 0.4 } },
@@ -538,9 +543,7 @@ async function runRecommend(queue = false) {
     }
 
     el.innerHTML = data.recommendations.map((r, i) => {
-      const moodTags    = (r.reason.shared_moods    || []).map(m => `<span class="tag mood">${m}</span>`).join("");
-      const tempoTags   = (r.reason.shared_tempos   || []).map(t => `<span class="tag concept">${t}</span>`).join("");
-      const textureTags = (r.reason.shared_textures || []).map(x => `<span class="tag concept">${x}</span>`).join("");
+      const energyTags  = (r.reason.shared_energy   || []).map(m => `<span class="tag mood">${m}</span>`).join("");
       const genreTags   = (r.reason.shared_genres   || []).map(g => `<span class="tag genre">${g}</span>`).join("");
       const eraTags     = (r.reason.shared_eras     || []).map(e => `<span class="tag" style="background:#2a1a1a;color:#f7a">${e}</span>`).join("");
       const artistBadge = r.reason.via_related_artist
@@ -561,7 +564,7 @@ async function runRecommend(queue = false) {
             <div class="rec-name">${esc(r.track.name)}</div>
             <div class="rec-artist">${esc((r.track.artist_names || []).join(", "))}</div>
             <div class="rec-tags">
-              ${moodTags}${genreTags}${eraTags}${artistBadge}${genreBadge}${vibeBadge}
+              ${genreTags}${energyTags}${eraTags}${artistBadge}${genreBadge}${vibeBadge}
             </div>
           </div>
           <div class="rec-score">${r.reason.score.toFixed(1)}</div>
@@ -604,7 +607,7 @@ function renderGraph(rawNodes, rawEdges) {
   const nodeData = rawNodes.map(n => {
     const isSeed = n.spotify_id === seedId && n.label === "Track";
     const style = isSeed ? SEED_STYLE
-                 : NODE_COLORS[n.label] || { background: "#666", border: "#555", font: { color: "#fff", size: 10 } };
+                 : NODE_COLORS[n.label] || { background: "#888", border: "#aaa", font: _LABEL(11) };
     const rawTitle = n.title || n.label;
     const shortLabel = rawTitle.length > 18 ? rawTitle.slice(0, 16) + "…" : rawTitle;
     const displayLabel = (n.label === "Track" || n.label === "Artist") ? shortLabel : rawTitle;

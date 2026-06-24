@@ -3,28 +3,36 @@
 Pipeline
 --------
 1. Get currently playing track from Spotify.
-2. Enrich track via Last.fm (genre + mood tags → graph nodes).
+2. Enrich track via Last.fm (genres) + Deezer (loudness/bpm → Energy bucket).
 3. Bootstrap graph:
      a. Last.fm similar artists → search on Spotify → ingest tracks
-     b. User's saved tracks → ingest
-4. Traverse graph: find tracks sharing Genre / Mood / Era nodes
-   or connected via SIMILAR_TO artist edges.
-5. Score candidates using three signals:
-     a. TF-IDF Genre Score  — rare shared genres score higher than common ones
-     b. Multi-Signal Bonus  — bonus when genre + mood + artist all match
-     c. Popularity Penalty  — penalize large popularity gap (niche vs mainstream)
+     b. User's saved tracks → ingest (excluded from being recommended)
+4. Weighted spreading activation from the seed over the graph: candidates
+   accumulate activation along shared Genre / Energy / Era nodes and along
+   weighted SIMILAR_TO (artist) and SONICALLY_SIMILAR (sonic) edges.
+5. Refine by vibe (fine Deezer energy distance), gate, diversify.
 6. Return top N (max 1 per artist); optionally add to Spotify queue.
 
-Scoring formula
+Ranking formula
 ---------------
-    genre_score    = Σ  log((N+1)/(freq_i+1)) + 1   for each shared genre i
-    mood_score     = shared_moods × 2.0
-    era_score      = shared_eras  × 0.5
-    multi_bonus    = (active_signals - 1) × 1.5      if >1 signal active
-    pop_penalty    = |seed.popularity - cand.popularity| / 100 × 0.8
+    relevance = w_g·Σidf(genre) + w_e·Σidf(energy) + w_a·artist_score
+              + w_s·sonic_score + w_era·#eras − pop_penalty
+    vibe_factor = 0.5 + 0.5·(1 − min(vibe_distance, 1))   (0.5 if no audio)
     ──────────────────────────────────────────────────────────────────
-    final_score    = genre_score + mood_score + era_score
-                   + multi_bonus - pop_penalty
+    score       = max(relevance, 0) × vibe_factor
+
+    artist_score = Σ over SIMILAR_TO paths of (edge weight × hop-decay), max path
+    sonic_score  = SONICALLY_SIMILAR.score
+
+    Gates (applied in recommend(), in order):
+      1. relevance — keep only real graph links (genre / artist / sonic);
+         energy- or era-only matches are dropped.
+      2. vibe — among those, drop energy outliers (vibe_distance > 0.35).
+    Plus: the user's saved tracks are excluded from candidates.
+
+Graph relevance (multiplicative) drives the order — a no-link track can't win
+on coincidental loudness; vibe only refines among genuinely related tracks.
+Signal weights live in the _W_* constants below.
 """
 
 from __future__ import annotations
@@ -53,6 +61,17 @@ MAX_TRACKS_PER_ARTIST = 10
 # Normalization for the Deezer energy proxy (so bpm and loudness are comparable)
 _BPM_NORM = 200.0        # typical bpm span 60–200
 _LOUDNESS_NORM = 20.0    # Deezer gain in dB, typically -20..0
+
+# Ranking: weighted spreading activation (graph relevance) refined by vibe.
+# Signal weights — retune here.
+_W_GENRE  = 1.0    # shared genres (already IDF-weighted)
+_W_ENERGY = 0.8    # shared Deezer energy buckets (already IDF-weighted)
+_W_ARTIST = 4.0    # artist similarity (SIMILAR_TO weight × hop-decay, ~0..1)
+_W_SONIC  = 3.0    # direct sonic edge (SONICALLY_SIMILAR score, ~0..1)
+_W_ERA    = 0.5    # shared era (weak, per shared era)
+
+_VIBE_NONE_DEFAULT = 0.5   # neutral vibe for candidates without Deezer audio data
+VIBE_GATE = 0.35           # drop relevant candidates whose energy is this far from the seed
 
 
 class Recommender:
@@ -87,6 +106,10 @@ class Recommender:
 
         exclude = set(await self._spotify.get_recently_played(limit=20))
         exclude |= set(await self._spotify.get_queue())
+        # Exclude the user's own library — they want graph discoveries related to
+        # the seed, not the songs they already listen to ("nicht meine Lieder").
+        saved = await self._spotify.get_saved_tracks(limit=50)
+        exclude |= {t.spotify_id for t in saved}
         exclude.add(source.spotify_id)
 
         candidates_raw = await self._graph.find_candidates(
@@ -103,17 +126,45 @@ class Recommender:
                 added_to_queue=False,
             )
 
-        # Genre frequencies for TF-IDF weighting — N = actual track count in graph
+        # Node frequencies for IDF weighting — N = actual track count in graph
         genre_freqs = await self._graph.get_genre_frequencies()
+        energy_freqs = await self._graph.get_energy_frequencies()
         stats = await self._graph.get_stats()
         total_tracks = max(int(stats.get("tracks", 1)), max(genre_freqs.values(), default=1))
         seed_popularity = source.popularity or 50
 
-        # Score with TF-IDF + multi-signal + popularity
-        scored = _score_candidates(candidates_raw, genre_freqs, total_tracks, seed_popularity)
+        # Score via weighted spreading activation × vibe refinement
+        scored = _score_candidates(
+            candidates_raw, genre_freqs, energy_freqs, total_tracks, seed_popularity
+        )
 
-        # Measurement: log current genre-driven ranking vs. vibe-driven ranking
+        # Measurement: log genre ranking vs. vibe ranking (still useful for tuning)
         _log_vibe_comparison(source, scored)
+
+        # 1) Relevance gate: only recommend tracks with a REAL graph connection
+        #    to the seed (shared genre / related artist / sonic edge). This drops
+        #    tracks that merely share an era or a coincidental loudness — e.g.
+        #    saved songs from an unrelated genre. "Schlage Lieder anhand Graph."
+        before = len(scored)
+        relevant = [c for c in scored if c.get("has_graph_link")]
+        logger.info(
+            "Relevance gate: kept %d/%d (dropped %d with no real graph link)",
+            len(relevant), before, before - len(relevant),
+        )
+        if relevant:
+            scored = relevant
+
+        # 2) Vibe gate: among relevant tracks, drop energy outliers. Tracks
+        #    without Deezer audio pass (we can't judge their energy).
+        before = len(scored)
+        gated = [c for c in scored
+                 if c.get("vibe_distance") is None or c["vibe_distance"] <= VIBE_GATE]
+        logger.info(
+            "Vibe gate (<= %.2f): kept %d/%d, dropped %d energy outliers",
+            VIBE_GATE, len(gated), before, before - len(gated),
+        )
+        if gated:
+            scored = gated
 
         # Diversity: max 1 track per artist
         top: list[dict] = []
@@ -143,7 +194,7 @@ class Recommender:
                 track=track_info,
                 reason=RecommendationReason(
                     shared_genres=list(c.get("shared_genres") or []),
-                    shared_moods=list(c.get("shared_moods") or []),
+                    shared_energy=list(c.get("shared_energy") or []),
                     shared_eras=list(c.get("shared_eras") or []),
                     via_related_artist=bool(c.get("via_related_artist")),
                     score=round(float(c.get("score", 0)), 2),
@@ -263,71 +314,74 @@ class Recommender:
 # Scoring: TF-IDF genres + multi-signal bonus + popularity penalty
 # ---------------------------------------------------------------------------
 
+def _idf(freq: int, total: int) -> float:
+    """Inverse document frequency — rare shared nodes carry more activation."""
+    return math.log((total + 1) / (freq + 1)) + 1
+
+
 def _score_candidates(
     candidates: list[dict],
     genre_freqs: dict[str, int],
+    energy_freqs: dict[str, int],
     total_tracks: int,
     seed_popularity: int,
 ) -> list[dict]:
     """
-    Score each candidate track using three signals:
+    Weighted spreading activation: each candidate's relevance is the weighted
+    sum of the graph paths connecting it to the seed, then refined by vibe.
 
-    1. TF-IDF Genre Score
-       Rare shared genres score higher than common ones.
-       score_i = log((N+1) / (freq_i+1)) + 1   for each shared genre i
-       → "balkanski trap" shared by 3 tracks scores ~3× higher than
-         "pop" shared by 150 tracks.
+        genre   = Σ idf(g)           over shared genres        (rare > common)
+        energy  = Σ idf(e)           over shared energy buckets (Deezer vibe)
+        artist  = artist_score       (Σ SIMILAR_TO weight × hop-decay, from query)
+        sonic   = sonic_score        (SONICALLY_SIMILAR.score, from query)
+        era     = #shared_eras × small constant
+        ───────────────────────────────────────────────────────────────────
+        relevance   = w_g·genre + w_e·energy + w_a·artist + w_s·sonic + w_era·era
+                      − popularity_penalty
+        vibe_factor = 0.5 + 0.5·(1 − min(vibe_distance, 1))   # ±50% from energy
+        score       = relevance × vibe_factor
 
-    2. Multi-Signal Bonus
-       Bonus when more than one signal type is active simultaneously
-       (genre + mood, genre + artist, all three).
-       bonus = (active_signals - 1) × 1.5
-       → Rewards tracks with multiple independent reasons to be recommended.
-
-    3. Popularity Penalty
-       Penalizes large popularity gaps between seed and candidate.
-       penalty = |seed_pop - cand_pop| / 100 × 0.8
-       → Playing underground music → mainstream hits are penalized.
+    Multiplicative refinement keeps relevance primary: a track with no real
+    graph link cannot win on a coincidental loudness match.
     """
     for c in candidates:
-        shared_genres   = c.get("shared_genres")   or []
-        shared_moods    = c.get("shared_moods")    or []
-        shared_eras     = c.get("shared_eras")     or []
-        via_artist      = bool(c.get("via_related_artist"))
-        direct_similar  = bool(c.get("direct_similar"))
-        cand_popularity = int(c.get("popularity") or 50)
+        shared_genres = c.get("shared_genres") or []
+        shared_energy = c.get("shared_energy") or []
+        shared_eras   = c.get("shared_eras")   or []
+        artist_score  = float(c.get("artist_score") or 0.0)
+        sonic_score   = float(c.get("sonic_score") or 0.0)
+        cand_pop      = int(c.get("popularity") or 50)
 
-        # 1. TF-IDF genre score
-        genre_score = 0.0
-        for genre in shared_genres:
-            freq = genre_freqs.get(genre, 1)
-            idf = math.log((total_tracks + 1) / (freq + 1)) + 1
-            genre_score += idf
+        genre_act  = sum(_idf(genre_freqs.get(g, 1), total_tracks) for g in shared_genres)
+        energy_act = sum(_idf(energy_freqs.get(e, 1), total_tracks) for e in shared_energy)
+        era_act    = len(shared_eras) * _W_ERA
+        pop_penalty = abs(seed_popularity - cand_pop) / 100.0 * 0.3
 
-        # 2. Mood score
-        mood_score = len(shared_moods) * 2.0
+        relevance = (
+            _W_GENRE  * genre_act
+            + _W_ENERGY * energy_act
+            + _W_ARTIST * artist_score
+            + _W_SONIC  * sonic_score
+            + era_act
+            - pop_penalty
+        )
 
-        # 3. Era score (minor signal)
-        era_score = len(shared_eras) * 0.5
-
-        # 4. Direct similarity bonus (SONICALLY_SIMILAR edge = strong direct connection)
-        direct_bonus = 3.0 if direct_similar else 0.0
-
-        # 5. Multi-signal bonus
-        active_signals = sum([genre_score > 0, mood_score > 0, via_artist, direct_similar])
-        multi_bonus = (active_signals - 1) * 1.5 if active_signals > 1 else 0.0
-
-        # 5. Popularity penalty (gentle — only penalizes extreme mismatches)
-        pop_penalty = abs(seed_popularity - cand_popularity) / 100.0 * 0.3
-
-        c["score"] = genre_score + mood_score + era_score + direct_bonus + multi_bonus - pop_penalty
-
-        # Measurement only — NOT yet folded into `score` ("erst messen").
-        c["genre_score"] = round(genre_score, 3)
-        c["vibe_distance"] = _vibe_distance(
+        # Vibe (fine-grained energy distance) refines the order ±50%.
+        vibe_distance = _vibe_distance(
             c.get("seed_bpm"), c.get("seed_loudness"),
             c.get("cand_bpm"), c.get("cand_loudness"),
         )
+        vibe_component = (_VIBE_NONE_DEFAULT if vibe_distance is None
+                          else 1.0 - min(vibe_distance, 1.0))
+
+        c["score"] = max(relevance, 0.0) * (0.5 + 0.5 * vibe_component)
+        # Real graph link = genre / artist / sonic (NOT energy or era alone).
+        c["has_graph_link"] = (genre_act > 0 or artist_score > 0 or sonic_score > 0)
+        # Component breakdown (for the measurement log + reason transparency).
+        c["genre_score"]  = round(genre_act, 3)
+        c["energy_score"] = round(energy_act, 3)
+        c["relevance"]    = round(relevance, 3)
+        c["vibe_distance"] = vibe_distance
 
     return sorted(candidates, key=lambda x: x["score"], reverse=True)
 
@@ -358,39 +412,31 @@ def _vibe_distance(
 
 def _log_vibe_comparison(source: TrackInfo, scored: list[dict], top_n: int = 15) -> None:
     """
-    Log the current genre-driven ranking next to a vibe-driven ranking so we
-    can eyeball whether high-genre-score tracks actually share the seed's
-    energy. Pure measurement — does not affect what gets recommended.
+    Log the spreading-activation breakdown per candidate (genre / energy /
+    artist / sonic → relevance, then vibe) so the ranking is inspectable.
+    Pure measurement — does not change what gets recommended.
     """
     top = scored[:top_n]
     with_vibe = [c for c in top if c.get("vibe_distance") is not None]
-    coverage = f"{len(with_vibe)}/{len(top)} have Deezer audio"
 
     logger.info(
-        "── Vibe measurement for '%s' (seed bpm=%s loud=%s) — %s ──",
+        "── Activation for '%s' (seed loud=%s) — %d/%d have Deezer audio ──",
         source.name,
-        _fmt(top[0].get("seed_bpm")) if top else "?",
         _fmt(top[0].get("seed_loudness")) if top else "?",
-        coverage,
+        len(with_vibe), len(top),
     )
-    logger.info("  genre rank | %-30s | genre | vibeΔ", "track")
+    logger.info("  rank | %-28s | genre energy artist sonic | relev | vibeΔ | score", "track")
     for i, c in enumerate(top, 1):
         vd = c.get("vibe_distance")
         logger.info(
-            "  G%-2d        | %-30s | %5.2f | %s",
-            i, (c.get("name") or "")[:30], float(c.get("genre_score", 0.0)),
-            f"{vd:.3f}" if vd is not None else " n/a",
+            "  %-4d | %-28s | %5.2f %5.2f %5.2f %5.2f | %5.2f | %5s | %5.2f",
+            i, (c.get("name") or "")[:28],
+            float(c.get("genre_score", 0.0)), float(c.get("energy_score", 0.0)),
+            float(c.get("artist_score", 0.0)), float(c.get("sonic_score", 0.0)),
+            float(c.get("relevance", 0.0)),
+            f"{vd:.2f}" if vd is not None else "n/a",
+            float(c.get("score", 0.0)),
         )
-
-    by_vibe = sorted(with_vibe, key=lambda x: x["vibe_distance"])
-    if by_vibe:
-        logger.info("  vibe rank (closest energy first):")
-        for i, c in enumerate(by_vibe[:10], 1):
-            logger.info(
-                "  V%-2d        | %-30s | %5.2f | %.3f",
-                i, (c.get("name") or "")[:30],
-                float(c.get("genre_score", 0.0)), c["vibe_distance"],
-            )
 
 
 def _fmt(v: Optional[float]) -> str:
