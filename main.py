@@ -31,6 +31,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic_settings import BaseSettings
 
 from deezer_client import DeezerClient
+from gnn_recommender import GnnScorer
 from graph_client import GraphClient
 from lastfm_client import LastFmClient
 from models import HealthResponse, RecommendationResponse
@@ -65,6 +66,7 @@ graph: Optional[GraphClient] = None
 spotify: Optional[SpotifyClient] = None
 lastfm: Optional[LastFmClient] = None
 deezer: Optional[DeezerClient] = None
+gnn: Optional[GnnScorer] = None
 recommender_svc: Optional[Recommender] = None
 _http_client_ctx = None       # keeps the SpotifyClient context open
 _polling_task: Optional[asyncio.Task] = None
@@ -99,8 +101,12 @@ async def lifespan(app: FastAPI):
     deezer = DeezerClient()
     await deezer.__aenter__()
 
+    global gnn
+    gnn = GnnScorer()
+    logger.info("GNN scorer: available=%s, trained=%s", gnn.available, gnn.is_ready())
+
     recommender_svc = Recommender(
-        graph=graph, spotify=spotify, lastfm=lastfm, deezer=deezer
+        graph=graph, spotify=spotify, lastfm=lastfm, deezer=deezer, gnn=gnn
     )
 
     logger.info("SpotiGraph started on http://%s:%d", settings.app_host, settings.app_port)
@@ -297,6 +303,28 @@ async def test_deezer(artist_name: str, track_name: str):
         raise HTTPException(503, "Deezer client not initialized")
     proxy = await deezer.get_audio_proxy(artist_name, track_name)
     return {"artist": artist_name, "track": track_name, "audio_proxy": proxy}
+
+
+@app.post("/admin/train-gnn", tags=["Admin"])
+async def train_gnn(epochs: int = Query(300, ge=10, le=2000)):
+    """Train the GraphSAGE link-prediction model on the current graph."""
+    _check_ready()
+    if gnn is None or not gnn.available:
+        raise HTTPException(503, "GNN not available (torch / torch_geometric not installed)")
+    export = await graph.export_graph()
+    result = gnn.train(export, epochs=epochs)
+    if "error" in result:
+        raise HTTPException(400, result["error"])
+    return {"status": "trained", **result}
+
+
+@app.get("/admin/gnn-status", tags=["Admin"])
+async def gnn_status():
+    """Report whether the GNN is available and whether a trained model exists."""
+    return {
+        "available": bool(gnn and gnn.available),
+        "trained": bool(gnn and gnn.is_ready()),
+    }
 
 
 # ---------------------------------------------------------------------------

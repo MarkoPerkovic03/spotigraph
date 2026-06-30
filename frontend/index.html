@@ -548,6 +548,8 @@ async function runRecommend(queue = false) {
       const eraTags     = (r.reason.shared_eras     || []).map(e => `<span class="tag" style="background:#2a1a1a;color:#f7a">${e}</span>`).join("");
       const artistBadge = r.reason.via_related_artist
         ? `<span class="tag" style="background:#1a2a3a;color:#7eb8f7">related artist</span>` : "";
+      const gnnBadge = r.reason.via_gnn
+        ? `<span class="tag" style="background:#3a2a1a;color:#f7b84a">GNN ${(r.reason.score*100).toFixed(0)}%</span>` : "";
 
       // Measurement badges: genre-only score + Deezer vibe (energy) distance
       const genreBadge = (typeof r.reason.genre_score === "number")
@@ -564,7 +566,7 @@ async function runRecommend(queue = false) {
             <div class="rec-name">${esc(r.track.name)}</div>
             <div class="rec-artist">${esc((r.track.artist_names || []).join(", "))}</div>
             <div class="rec-tags">
-              ${genreTags}${energyTags}${eraTags}${artistBadge}${genreBadge}${vibeBadge}
+              ${genreTags}${energyTags}${eraTags}${artistBadge}${gnnBadge}${genreBadge}${vibeBadge}
             </div>
           </div>
           <div class="rec-score">${r.reason.score.toFixed(1)}</div>

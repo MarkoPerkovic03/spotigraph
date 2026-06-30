@@ -43,6 +43,7 @@ from typing import Optional
 
 from deezer_client import DeezerClient
 from enrichment import enrich
+from gnn_recommender import GnnScorer
 from graph_client import GraphClient
 from lastfm_client import LastFmClient
 from models import (
@@ -81,11 +82,13 @@ class Recommender:
         spotify: SpotifyClient,
         lastfm: LastFmClient,
         deezer: Optional[DeezerClient] = None,
+        gnn: Optional["GnnScorer"] = None,
     ) -> None:
         self._graph   = graph
         self._spotify = spotify
         self._lastfm  = lastfm
         self._deezer  = deezer
+        self._gnn     = gnn
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -133,12 +136,33 @@ class Recommender:
         total_tracks = max(int(stats.get("tracks", 1)), max(genre_freqs.values(), default=1))
         seed_popularity = source.popularity or 50
 
-        # Score via weighted spreading activation × vibe refinement
+        # Heuristic scoring (spreading activation) — always computed: it fills
+        # the explainability fields (genre/energy/vibe) and the gate flags.
         scored = _score_candidates(
             candidates_raw, genre_freqs, energy_freqs, total_tracks, seed_popularity
         )
 
-        # Measurement: log genre ranking vs. vibe ranking (still useful for tuning)
+        # GNN re-ranking: if a trained model exists, replace the ranking score
+        # with the learned link-prediction probability seed↔candidate.
+        # Falls back silently to the heuristic order when unavailable.
+        if self._gnn is not None and self._gnn.is_ready():
+            try:
+                export = await self._graph.export_graph()
+                probs = self._gnn.score(
+                    export, source.spotify_id, [c["spotify_id"] for c in scored]
+                )
+                if probs:
+                    for c in scored:
+                        c["gnn_prob"] = probs.get(c["spotify_id"])
+                        if c["gnn_prob"] is not None:
+                            c["score"] = round(float(c["gnn_prob"]), 4)
+                            c["via_gnn"] = True
+                    scored.sort(key=lambda x: x["score"], reverse=True)
+                    logger.info("GNN link-prediction applied to %d candidates", len(probs))
+            except Exception as exc:
+                logger.warning("GNN scoring failed, using heuristic order: %s", exc)
+
+        # Measurement: log the activation/score breakdown
         _log_vibe_comparison(source, scored)
 
         # 1) Relevance gate: only recommend tracks with a REAL graph connection
@@ -197,7 +221,8 @@ class Recommender:
                     shared_energy=list(c.get("shared_energy") or []),
                     shared_eras=list(c.get("shared_eras") or []),
                     via_related_artist=bool(c.get("via_related_artist")),
-                    score=round(float(c.get("score", 0)), 2),
+                    via_gnn=bool(c.get("via_gnn")),
+                    score=round(float(c.get("score", 0)), 3),
                     genre_score=round(float(c.get("genre_score", 0)), 2),
                     vibe_distance=c.get("vibe_distance"),
                     seed_bpm=c.get("seed_bpm") or None,

@@ -504,6 +504,46 @@ class GraphClient:
                 return {"tracks": 0, "artists": 0, "genres": 0, "moods": 0}
             return dict(record)
 
+    async def export_graph(self) -> dict[str, Any]:
+        """
+        Export the whole graph for the GNN: every node with a stable string id
+        (`t:`/`a:`/`g:`/`en:`/`er:` prefix) + node type + Track audio features,
+        and every relevant edge as (source, target) id pairs.
+        """
+        def id_expr(v: str) -> str:
+            return (
+                f"CASE WHEN {v}:Track THEN 't:'+{v}.spotify_id "
+                f"WHEN {v}:Artist THEN 'a:'+{v}.name "
+                f"WHEN {v}:Genre THEN 'g:'+{v}.name "
+                f"WHEN {v}:Energy THEN 'en:'+{v}.name "
+                f"WHEN {v}:Era THEN 'er:'+{v}.label END"
+            )
+        async with self._driver.session() as session:
+            node_res = await session.run(
+                f"""
+                MATCH (n)
+                WHERE n:Track OR n:Artist OR n:Genre OR n:Energy OR n:Era
+                RETURN {id_expr('n')} AS id, labels(n)[0] AS type,
+                       n.spotify_id AS track_id,
+                       coalesce(n.loudness, 0.0)  AS loudness,
+                       coalesce(n.tempo, 0.0)     AS bpm,
+                       coalesce(n.popularity, 0)  AS popularity
+                """
+            )
+            nodes = [dict(r) async for r in node_res]
+
+            edge_res = await session.run(
+                f"""
+                MATCH (a)-[r]->(b)
+                WHERE (a:Track OR a:Artist OR a:Genre OR a:Energy OR a:Era)
+                  AND (b:Track OR b:Artist OR b:Genre OR b:Energy OR b:Era)
+                RETURN {id_expr('a')} AS source, {id_expr('b')} AS target
+                """
+            )
+            edges = [dict(r) async for r in edge_res]
+
+        return {"nodes": nodes, "edges": edges}
+
     async def get_neighborhood(self, track_id: str) -> dict[str, Any]:
         """
         Return nodes and edges for vis.js visualization.

@@ -104,6 +104,7 @@ class RecommendationReason(BaseModel):
     shared_energy: list[str] = Field(default_factory=list)
     shared_eras: list[str] = Field(default_factory=list)
     via_related_artist: bool = False
+    via_gnn: bool = False          # score is a GNN link-prediction probability
     score: float = 0.0
     # Measurement fields — let us compare the genre-driven score against the
     # new Deezer vibe (energy) distance side-by-side before re-weighting.
